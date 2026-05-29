@@ -1,12 +1,17 @@
+package com.enterprise.sftp;
+
+import com.enterprise.sftp.config.SftpTransferProperties;
+import com.enterprise.sftp.config.SftpConnectionConfig.PooledSshClient;
 import net.schmizz.sshj.SSHClient;
 import net.schmizz.sshj.sftp.OpenMode;
 import net.schmizz.sshj.sftp.RemoteFile;
 import net.schmizz.sshj.sftp.SFTPClient;
-import net.schmizz.sshj.transport.verification.PromiscuousVerifier;
-import net.schmizz.sshj.userauth.keyprovider.KeyProvider;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
 
 import java.io.*;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.time.Duration;
@@ -16,113 +21,26 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Standalone Java 21 SFTP file copy — no framework dependencies.
- *
- * <p><b>Usage:</b>
- * <pre>
- *   java --enable-preview -cp ".:lib/*" SftpFileCopy \
- *       &lt;sourceFile&gt; &lt;destinationPath&gt; &lt;destinationFile&gt;
- * </pre>
- *
- * <p><b>SFTP credentials</b> — edit the CONFIG section below or pass as
- * environment variables:
- * <pre>
- *   SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASSWORD,
- *   SFTP_KEY_PATH  (private key; takes priority over password)
- * </pre>
- *
- * <p><b>Performance model:</b>
- * <ul>
- *   <li>Small files ({@code < CHUNK_SIZE_BYTES}) — single-stream via
- *       {@link InputStream#transferTo}, one SSH connection.</li>
- *   <li>Large files ({@code >= CHUNK_SIZE_BYTES}) — parallel chunks on
- *       Java 21 virtual threads, coordinated by
- *       {@link StructuredTaskScope.ShutdownOnFailure}.
- *       Memory-mapped {@link FileChannel} reads keep heap pressure low.
- *       One SSH connection per chunk, drawn from the pool.</li>
- * </ul>
- *
- * <p><b>Compile (Java 21):</b>
- * <pre>
- *   javac --enable-preview --release 21 -cp "lib/*" SftpFileCopy.java
- * </pre>
- *
- * <p>Requires on classpath: {@code sshj-*.jar} and its transitive deps
- * (slf4j-api, bcprov, eddsa).
+ * SFTP file copy — Java 21, stripped to core transfer only.
  */
+@Component
 public class SftpFileCopy {
 
-    // =========================================================================
-    // CONFIG — override via environment variables or edit directly
-    // =========================================================================
+    private static final Logger log = LoggerFactory.getLogger(SftpFileCopy.class);
 
-    private static final String  SFTP_HOST             = env("SFTP_HOST",            "sftp.example.com");
-    private static final int     SFTP_PORT             = intEnv("SFTP_PORT",          22);
-    private static final String  SFTP_USER             = env("SFTP_USER",             "sftpuser");
-    private static final String  SFTP_PASSWORD         = env("SFTP_PASSWORD",         "");      // used if no key
-    private static final String  SFTP_KEY_PATH         = env("SFTP_KEY_PATH",         "");      // e.g. ~/.ssh/id_rsa
+    private final SftpTransferProperties cfg;
+    private final PooledSshClient        sshPool;
 
-    /** Number of pooled SSH connections. Also caps chunk parallelism. */
-    private static final int     SSH_POOL_SIZE         = intEnv("SSH_POOL_SIZE",       4);
-
-    /** Files larger than this are transferred in parallel chunks. Default 64 MB. */
-    private static final long    CHUNK_SIZE_BYTES      = longEnv("CHUNK_SIZE_BYTES",   64L * 1024 * 1024);
-
-    /** Read/write buffer size per stream/chunk. Default 256 KB. */
-    private static final int     BUFFER_SIZE_BYTES     = intEnv("BUFFER_SIZE_BYTES",   256 * 1024);
-
-    /** Per-chunk timeout multiplier (minutes). Total deadline = this × chunkCount. */
-    private static final long    TIMEOUT_PER_CHUNK_MIN = longEnv("TIMEOUT_PER_CHUNK_MIN", 10L);
-
-    /** SSH connect + auth timeout (milliseconds). */
-    private static final int     CONNECT_TIMEOUT_MS    = intEnv("CONNECT_TIMEOUT_MS", 15_000);
-
-    // =========================================================================
-    // Entry point
-    // =========================================================================
-
-    public static void main(String[] args) {
-        if (args.length != 3) {
-            System.err.println("Usage: SftpFileCopy <sourceFile> <destinationPath> <destinationFile>");
-            System.exit(1);
-        }
-
-        String sourceFile      = args[0];
-        String destinationPath = args[1];
-        String destinationFile = args[2];
-
-        PooledSshClient pool = null;
-        try {
-            pool = new PooledSshClient(SSH_POOL_SIZE);
-
-            TransferResult result = copyFile(sourceFile, destinationPath, destinationFile, pool);
-
-            switch (result) {
-                case TransferResult.Success(long bytes, Duration elapsed, double mbps, String id) ->
-                    System.out.printf("[%s] SUCCESS — %,d bytes @ %.2f MB/s in %ds%n",
-                            id, bytes, mbps, elapsed.toSeconds());
-
-                case TransferResult.Failure(String reason, Throwable cause, String id) -> {
-                    System.err.printf("[%s] FAILED — %s%n", id, reason);
-                    if (cause != null) cause.printStackTrace(System.err);
-                    System.exit(2);
-                }
-            }
-
-        } catch (Exception ex) {
-            System.err.println("Fatal: " + ex.getMessage());
-            ex.printStackTrace(System.err);
-            System.exit(3);
-        } finally {
-            if (pool != null) pool.close();
-        }
+    public SftpFileCopy(SftpTransferProperties cfg, PooledSshClient sshPool) {
+        this.cfg    = cfg;
+        this.sshPool = sshPool;
+        log.info("SftpFileCopy ready — sftp={} chunkSize={}MB",
+                cfg.enabled(), cfg.chunkSizeBytes() / (1024 * 1024));
     }
 
-    // =========================================================================
-    // Sealed result hierarchy
-    // =========================================================================
+    // ── Sealed result hierarchy ───────────────────────────────────────────────
 
-    sealed interface TransferResult
+    public sealed interface TransferResult
             permits TransferResult.Success, TransferResult.Failure {
 
         record Success(long     bytesTransferred,
@@ -135,128 +53,35 @@ public class SftpFileCopy {
                        String    transferId) implements TransferResult {}
     }
 
-    // =========================================================================
-    // Chunk coordination records
-    // =========================================================================
+    // ── Public API ────────────────────────────────────────────────────────────
 
-    /** Immutable descriptor — passed into each virtual-thread chunk task. */
-    record ChunkDescriptor(int    index,
-                           int    totalChunks,
-                           long   offset,
-                           long   length,
-                           String remoteDest,
-                           String transferId,
-                           Path   sourcePath) {}
-
-    record ChunkResult(int     chunkIndex,
-                       long    bytesWritten,
-                       boolean success) {}
-
-    // =========================================================================
-    // SSH Connection Pool
-    // =========================================================================
-
-    /**
-     * Fixed-size pool of {@link SSHClient} connections backed by an
-     * {@link ArrayBlockingQueue}.
-     *
-     * <ul>
-     *   <li>{@link #borrowClient()} blocks the calling virtual thread until a
-     *       connection is available — this is the <em>sole</em> concurrency
-     *       limiter for parallel chunks. No semaphore or extra locking needed.</li>
-     *   <li>Stale/closed connections are detected on borrow and replaced
-     *       transparently so the pool self-heals after transient network faults.</li>
-     *   <li>Broken connections returned via {@link #returnClient} are replaced
-     *       inline to keep pool size stable.</li>
-     * </ul>
-     */
-    static final class PooledSshClient implements Closeable {
-
-        private final ArrayBlockingQueue<SSHClient> pool;
-        private final AtomicLong uploadCount = new AtomicLong();
-
-        PooledSshClient(int size) throws IOException {
-            this.pool = new ArrayBlockingQueue<>(size);
-            for (int i = 0; i < size; i++) {
-                pool.offer(openConnection());
-            }
-            System.out.printf("[pool] Initialised %d SSH connections → %s:%d%n",
-                    size, SFTP_HOST, SFTP_PORT);
-        }
-
-        /** Blocks (virtual thread parks) until a healthy connection is available. */
-        SSHClient borrowClient() throws InterruptedException, IOException {
-            SSHClient client = pool.take();
-            if (!client.isConnected() || !client.isAuthenticated()) {
-                System.out.println("[pool] Stale connection detected — replacing");
-                closeQuietly(client);
-                client = openConnection();
-            }
-            return client;
-        }
-
-        /** Returns a connection; replaces it if no longer healthy. */
-        void returnClient(SSHClient client) {
-            if (client.isConnected() && client.isAuthenticated()) {
-                pool.offer(client);
-            } else {
-                try {
-                    pool.offer(openConnection());
-                } catch (IOException ex) {
-                    System.err.printf("[pool] Could not replace broken connection: %s%n",
-                            ex.getMessage());
-                }
-            }
-        }
-
-        void incrementUploadCount() { uploadCount.incrementAndGet(); }
-        long uploadCount()          { return uploadCount.get(); }
-
-        @Override
-        public void close() {
-            List<SSHClient> drained = new ArrayList<>();
-            pool.drainTo(drained);
-            drained.forEach(SftpFileCopy::closeQuietly);
-            System.out.printf("[pool] Closed. Total chunks uploaded: %d%n", uploadCount.get());
-        }
-
-        // ── Connection factory ────────────────────────────────────────────────
-
-        private static SSHClient openConnection() throws IOException {
-            SSHClient ssh = new SSHClient();
-            // Replace PromiscuousVerifier with OpenSSHKnownHosts in production:
-            //   ssh.addHostKeyVerifier(new OpenSSHKnownHosts(new File("~/.ssh/known_hosts")));
-            ssh.addHostKeyVerifier(new PromiscuousVerifier());
-            ssh.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            ssh.connect(SFTP_HOST, SFTP_PORT);
-
-            if (!SFTP_KEY_PATH.isEmpty()) {
-                KeyProvider keys = ssh.loadKeys(SFTP_KEY_PATH);
-                ssh.authPublickey(SFTP_USER, keys);
-            } else {
-                ssh.authPassword(SFTP_USER, SFTP_PASSWORD);
-            }
-            return ssh;
-        }
-    }
-
-    // =========================================================================
-    // Copy orchestration
-    // =========================================================================
-
-    static TransferResult copyFile(String          sourceFile,
-                                   String          destinationPath,
-                                   String          destinationFile,
-                                   PooledSshClient pool) {
+    public TransferResult copyFile(String sourceFile,
+                                   String destinationPath,
+                                   String destinationFile) {
 
         final String  transferId = UUID.randomUUID().toString();
         final Instant start      = Instant.now();
-        final String  sep        = destinationPath.endsWith("/")
-                || destinationPath.endsWith(File.separator) ? "" : "/";
+        final String  separator  = StringUtils.endsWith(destinationPath, File.separator)
+                ? "" : File.separator;
 
-        System.out.printf("[%s] Transfer start — src=%s  dst=%s%s%s%n",
-                transferId, sourceFile, destinationPath, sep, destinationFile);
+        log.info("[{}] Transfer start — src={} dst={}/{}",
+                transferId, sourceFile, destinationPath, destinationFile);
 
+        return cfg.enabled()
+                ? transferViaSftp(sourceFile, destinationPath, destinationFile,
+                                  separator, transferId, start)
+                : transferLocal(sourceFile, destinationPath, destinationFile,
+                                separator, transferId, start);
+    }
+
+    // ── SFTP dispatch ─────────────────────────────────────────────────────────
+
+    private TransferResult transferViaSftp(String sourceFile,
+                                           String destinationPath,
+                                           String destinationFile,
+                                           String separator,
+                                           String transferId,
+                                           Instant start) {
         Path sourcePath = Path.of(sourceFile);
         long fileSize;
         try {
@@ -265,233 +90,560 @@ public class SftpFileCopy {
             return new TransferResult.Failure("Cannot read source file size", ex, transferId);
         }
 
-        String remoteDest = destinationPath + sep + destinationFile;
+        String remoteDest = destinationPath + separator + destinationFile;
 
-        return fileSize >= CHUNK_SIZE_BYTES
-                ? chunkedParallelTransfer(sourcePath, fileSize, remoteDest, transferId, start, pool)
-                : singleStreamTransfer(sourcePath, fileSize, remoteDest, transferId, start, pool);
+        return cfg.requiresChunkedTransfer(fileSize)
+                ? chunkedParallelTransfer(sourcePath, fileSize, remoteDest, transferId, start)
+                : singleStreamTransfer(sourcePath, fileSize, remoteDest, transferId, start);
     }
 
-    // =========================================================================
-    // Single-stream  (file < CHUNK_SIZE_BYTES)
-    // =========================================================================
+    // ── Single-stream transfer ────────────────────────────────────────────────
 
-    private static TransferResult singleStreamTransfer(Path            sourcePath,
-                                                        long            fileSize,
-                                                        String          remoteDest,
-                                                        String          transferId,
-                                                        Instant         start,
-                                                        PooledSshClient pool) {
-        SSHClient  sshClient  = null;
-        SFTPClient sftpClient = null;
-
+    private TransferResult singleStreamTransfer(Path    sourcePath,
+                                                long    fileSize,
+                                                String  remoteDest,
+                                                String  transferId,
+                                                Instant start) {
+        SSHClient  ssh  = null;
+        SFTPClient sftp = null;
         try {
-            sshClient  = pool.borrowClient();
-            sftpClient = sshClient.newSFTPClient();
+            ssh  = sshPool.borrowClient();
+            sftp = ssh.newSFTPClient();
 
-            try (RemoteFile remoteOut = sftpClient.open(
-                         remoteDest, EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.TRUNC));
+            try (RemoteFile remoteFile = sftp.open(
+                         remoteDest, EnumSet.of(OpenMode.WRITE, OpenMode.CREAT));
+                 InputStream  in  = new BufferedInputStream(
+                         Files.newInputStream(sourcePath), cfg.bufferSizeBytes());
+                 OutputStream out = new BufferedOutputStream(
+                         remoteFile.new RemoteFileOutputStream(), cfg.bufferSizeBytes())) {
 
-                 InputStream  src = new BufferedInputStream(
-                         Files.newInputStream(sourcePath), BUFFER_SIZE_BYTES);
-
-                 OutputStream dst = new BufferedOutputStream(
-                         remoteOut.new RemoteFileOutputStream(), BUFFER_SIZE_BYTES)) {
-
-                src.transferTo(dst);    // Java 9+ — no manual byte[] loop
-                dst.flush();
+                in.transferTo(out);
+                out.flush();
             }
 
             Duration elapsed = Duration.between(start, Instant.now());
-            double   mbps    = toMBps(fileSize, elapsed);
-            System.out.printf("[%s] Single-stream complete — %.2f MB/s%n", transferId, mbps);
-            return new TransferResult.Success(fileSize, elapsed, mbps, transferId);
+            log.info("[{}] Single-stream complete — {:.2f} MB/s",
+                    transferId, toMBps(fileSize, elapsed));
+            return new TransferResult.Success(
+                    fileSize, elapsed, toMBps(fileSize, elapsed), transferId);
 
         } catch (Exception ex) {
-            System.err.printf("[%s] Single-stream failed: %s%n", transferId, ex.getMessage());
+            log.error("[{}] Single-stream failed", transferId, ex);
             return new TransferResult.Failure("SFTP single-stream error", ex, transferId);
-
         } finally {
-            closeQuietly(sftpClient);
-            if (sshClient != null) pool.returnClient(sshClient);
+            closeQuietly(sftp);
+            if (ssh != null) sshPool.returnClient(ssh);
         }
     }
 
-    // =========================================================================
-    // Chunked parallel  (file >= CHUNK_SIZE_BYTES)
-    // =========================================================================
+    // ── Chunked parallel transfer — Java 21 StructuredTaskScope ──────────────
 
     /**
-     * Splits the file into {@code N = ceil(fileSize / CHUNK_SIZE_BYTES)} chunks
-     * and transfers each on its own Java 21 virtual thread.
+     * Parallel chunk upload using {@link StructuredTaskScope.ShutdownOnFailure}.
      *
      * <ul>
-     *   <li>All chunks forked simultaneously; SSH pool caps actual parallelism.</li>
-     *   <li>{@link StructuredTaskScope.ShutdownOnFailure} cancels every sibling
-     *       the moment any single chunk throws — no partial silent writes.</li>
-     *   <li>Single wall-clock deadline:
-     *       {@code TIMEOUT_PER_CHUNK_MIN × totalChunks} minutes.</li>
-     *   <li>Memory-mapped reads: OS page cache serves data; heap holds only
-     *       one {@code BUFFER_SIZE_BYTES} slice at a time per chunk.</li>
+     *   <li>Each chunk runs on its own virtual thread — SSH pool is the only
+     *       concurrency limiter.</li>
+     *   <li>Any chunk exception immediately cancels all sibling virtual threads.</li>
+     *   <li>{@code scope.joinUntil(deadline)} enforces one wall-clock deadline
+     *       across the entire transfer.</li>
      * </ul>
      */
-    private static TransferResult chunkedParallelTransfer(Path            sourcePath,
-                                                           long            fileSize,
-                                                           String          remoteDest,
-                                                           String          transferId,
-                                                           Instant         start,
-                                                           PooledSshClient pool) {
-
-        int     totalChunks  = (int) Math.ceil((double) fileSize / CHUNK_SIZE_BYTES);
-        Instant deadline     = start.plus(Duration.ofMinutes(TIMEOUT_PER_CHUNK_MIN * totalChunks));
+    private TransferResult chunkedParallelTransfer(Path    sourcePath,
+                                                   long    fileSize,
+                                                   String  remoteDest,
+                                                   String  transferId,
+                                                   Instant start) {
+        int        totalChunks  = cfg.chunkCount(fileSize);
         AtomicLong totalWritten = new AtomicLong();
-
-        System.out.printf("[%s] Chunked transfer — %d chunks, pool=%d, deadline=%dm%n",
-                transferId, totalChunks, SSH_POOL_SIZE, TIMEOUT_PER_CHUNK_MIN * totalChunks);
+        Instant    deadline     = start.plus(
+                Duration.ofMinutes(cfg.timeoutPerChunkMinutes() * (long) totalChunks));
 
         try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
 
-            List<StructuredTaskScope.Subtask<ChunkResult>> subtasks = new ArrayList<>(totalChunks);
-
             for (int i = 0; i < totalChunks; i++) {
-                long chunkOffset = (long) i * CHUNK_SIZE_BYTES;
-                long chunkLength = Math.min(CHUNK_SIZE_BYTES, fileSize - chunkOffset);
+                final int  idx    = i;
+                final long offset = (long) i * cfg.chunkSizeBytes();
+                final long length = cfg.chunkLength(i, totalChunks, fileSize);
 
-                ChunkDescriptor desc = new ChunkDescriptor(
-                        i, totalChunks, chunkOffset, chunkLength,
-                        remoteDest, transferId, sourcePath);
-
-                // fork() submits to a fresh virtual thread immediately
-                subtasks.add(scope.fork(() -> transferChunk(desc, totalWritten, pool)));
+                scope.fork(() -> transferChunk(
+                        sourcePath, remoteDest, idx, offset, length,
+                        transferId, totalWritten));
             }
 
-            scope.joinUntil(deadline);   // blocks calling (platform) thread
-            scope.throwIfFailed();       // re-throws first chunk exception if any
+            scope.joinUntil(deadline);   // single deadline for all chunks
+            scope.throwIfFailed();       // re-throws first chunk exception
 
             Duration elapsed = Duration.between(start, Instant.now());
             double   mbps    = toMBps(fileSize, elapsed);
-            System.out.printf("[%s] Chunked complete — %.2f MB/s over %d chunks%n",
+            log.info("[{}] Chunked complete — {:.2f} MB/s over {} chunks",
                     transferId, mbps, totalChunks);
             return new TransferResult.Success(fileSize, elapsed, mbps, transferId);
 
         } catch (ExecutionException ex) {
-            System.err.printf("[%s] Chunk failed — all siblings cancelled: %s%n",
-                    transferId, ex.getCause().getMessage());
-            return new TransferResult.Failure("Chunk transfer failed", ex.getCause(), transferId);
-
+            log.error("[{}] Chunk failed — all siblings cancelled", transferId, ex.getCause());
+            return new TransferResult.Failure(
+                    "Chunk transfer failed", ex.getCause(), transferId);
         } catch (TimeoutException ex) {
-            System.err.printf("[%s] Transfer deadline exceeded (%dm × %d chunks)%n",
-                    transferId, TIMEOUT_PER_CHUNK_MIN, totalChunks);
+            log.error("[{}] Transfer deadline exceeded", transferId);
             return new TransferResult.Failure("Transfer deadline exceeded", ex, transferId);
-
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             return new TransferResult.Failure("Transfer interrupted", ex, transferId);
         }
     }
 
-    // =========================================================================
-    // One chunk — runs on a virtual thread
-    // =========================================================================
+    // ── One chunk — runs on a virtual thread ──────────────────────────────────
 
-    /**
-     * Executes on a Java 21 virtual thread forked by the scope.
-     *
-     * <ul>
-     *   <li>Virtual thread <em>parks</em> (not OS-blocks) on
-     *       {@link ArrayBlockingQueue#take} waiting for a pool connection —
-     *       the carrier thread is released during that wait.</li>
-     *   <li>Virtual thread parks again on SFTP network I/O — carrier thread
-     *       free during network latency, so hundreds of chunks can be
-     *       in-flight with only a handful of OS threads.</li>
-     *   <li>Throws on any failure; {@link StructuredTaskScope.ShutdownOnFailure}
-     *       then cancels all sibling virtual threads immediately.</li>
-     * </ul>
-     */
-    private static ChunkResult transferChunk(ChunkDescriptor desc,
-                                             AtomicLong      totalWritten,
-                                             PooledSshClient pool) throws Exception {
-        SSHClient  sshClient  = null;
-        SFTPClient sftpClient = null;
-
+    private Void transferChunk(Path       sourcePath,
+                               String     remoteDest,
+                               int        chunkIndex,
+                               long       offset,
+                               long       length,
+                               String     transferId,
+                               AtomicLong totalWritten) throws Exception {
+        SSHClient  ssh  = null;
+        SFTPClient sftp = null;
         try {
-            sshClient  = pool.borrowClient();          // parks virtual thread if pool empty
-            sftpClient = sshClient.newSFTPClient();
+            ssh  = sshPool.borrowClient();
+            sftp = ssh.newSFTPClient();
 
-            try (FileChannel channel = FileChannel.open(desc.sourcePath(), StandardOpenOption.READ);
-
-                 RemoteFile remoteFile = sftpClient.open(
-                         desc.remoteDest(),
+            try (FileChannel  channel = FileChannel.open(sourcePath, StandardOpenOption.READ);
+                 RemoteFile   remote  = sftp.open(
+                         remoteDest,
                          EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.APPEND));
+                 OutputStream out     = new BufferedOutputStream(
+                         remote.new RemoteFileOutputStream(offset), cfg.bufferSizeBytes())) {
 
-                 OutputStream remoteOut = new BufferedOutputStream(
-                         remoteFile.new RemoteFileOutputStream(desc.offset()),
-                         BUFFER_SIZE_BYTES)) {
+                java.nio.MappedByteBuffer mapped =
+                        channel.map(FileChannel.MapMode.READ_ONLY, offset, length);
 
-                // Memory-mapped read — OS page cache; heap holds only one slice
-                MappedByteBuffer mapped = channel.map(
-                        FileChannel.MapMode.READ_ONLY, desc.offset(), desc.length());
-
-                byte[] slice     = new byte[BUFFER_SIZE_BYTES];
-                long   remaining = desc.length();
+                byte[] buf       = new byte[cfg.bufferSizeBytes()];
+                long   remaining = length;
 
                 while (remaining > 0) {
-                    int batch = (int) Math.min(BUFFER_SIZE_BYTES, remaining);
-                    mapped.get(slice, 0, batch);
-                    remoteOut.write(slice, 0, batch);
+                    int batch = (int) Math.min(cfg.bufferSizeBytes(), remaining);
+                    mapped.get(buf, 0, batch);
+                    out.write(buf, 0, batch);
                     totalWritten.addAndGet(batch);
                     remaining -= batch;
                 }
-
-                remoteOut.flush();
+                out.flush();
             }
 
-            System.out.printf("[%s] Chunk %d/%d done (%d MB)%n",
-                    desc.transferId(), desc.index() + 1, desc.totalChunks(),
-                    desc.length() / (1024 * 1024));
-
-            return new ChunkResult(desc.index(), desc.length(), true);
-
-        } catch (Exception ex) {
-            System.err.printf("[%s] Chunk %d failed: %s%n",
-                    desc.transferId(), desc.index(), ex.getMessage());
-            throw ex;   // triggers ShutdownOnFailure → all siblings cancelled
+            log.info("[{}] Chunk {} done ({} MB)",
+                    transferId, chunkIndex, length / (1024 * 1024));
+            return null;    // Void — ShutdownOnFailure needs a return type
 
         } finally {
-            closeQuietly(sftpClient);
-            if (sshClient != null) {
-                pool.incrementUploadCount();
-                pool.returnClient(sshClient);
+            closeQuietly(sftp);
+            if (ssh != null) {
+                sshPool.incrementUploadCount();
+                sshPool.returnClient(ssh);
             }
         }
     }
 
-    // =========================================================================
-    // Utility
-    // =========================================================================
+    // ── Local NIO2 fallback (cfg.enabled() == false) ──────────────────────────
+
+    private TransferResult transferLocal(String  sourceFile,
+                                         String  destinationPath,
+                                         String  destinationFile,
+                                         String  separator,
+                                         String  transferId,
+                                         Instant start) {
+        try {
+            Path src  = Path.of(sourceFile);
+            Path dest = Path.of(destinationPath + separator + destinationFile);
+            Files.createDirectories(dest.getParent());
+            long     written = Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
+            Duration elapsed = Duration.between(start, Instant.now());
+            return new TransferResult.Success(
+                    written, elapsed, toMBps(written, elapsed), transferId);
+        } catch (Exception ex) {
+            log.error("[{}] Local copy failed", transferId, ex);
+            return new TransferResult.Failure("Local copy error", ex, transferId);
+        }
+    }
+
+    // ── Utility ───────────────────────────────────────────────────────────────
 
     private static double toMBps(long bytes, Duration elapsed) {
         return (bytes / (1024.0 * 1024.0)) / Math.max(elapsed.toMillis() / 1000.0, 0.001);
     }
 
-    private static void closeQuietly(Closeable c) {
+    private void closeQuietly(Closeable c) {
         if (c != null) try { c.close(); } catch (IOException ignored) {}
     }
 
-    // ── Environment helpers ───────────────────────────────────────────────────
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    private static String env(String key, String defaultVal) {
-        String v = System.getenv(key);
-        return (v != null && !v.isBlank()) ? v : defaultVal;
-    }
-
-    private static int intEnv(String key, int defaultVal) {
-        try { return Integer.parseInt(System.getenv(key)); }
-        catch (Exception ignored) { return defaultVal; }
-    }
-
-    private static long longEnv(String key, long defaultVal) {
-        try { return Long.parseLong(System.getenv(key)); }
-        catch (Exception ignored) { return defaultVal; }
+    @jakarta.annotation.PreDestroy
+    public void shutdown() {
+        log.info("SftpFileCopy shutdown complete");
     }
 }
+
+
+package com.enterprise.sftp;
+
+import com.enterprise.sftp.config.SftpTransferProperties;
+import com.enterprise.sftp.config.SftpConnectionConfig.PooledSshClient;
+import net.schmizz.sshj.SSHClient;
+import net.schmizz.sshj.sftp.OpenMode;
+import net.schmizz.sshj.sftp.RemoteFile;
+import net.schmizz.sshj.sftp.SFTPClient;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import java.io.*;
+import java.nio.channels.FileChannel;
+import java.nio.file.*;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * SFTP file copy.
+ */
+@Component
+public class SftpFileCopy {
+
+    private static final Logger log = LoggerFactory.getLogger(SftpFileCopy.class);
+
+    private final SftpTransferProperties cfg;
+    private final PooledSshClient        sshPool;
+
+    /**
+     * Java 17: fixed platform-thread pool.
+     *
+     * <p>Size is pinned to {@code sshPoolSize} — if we allowed more threads
+     * than SSH clients, extra threads would immediately block on
+     * {@link PooledSshClient#borrowClient()}, wasting OS resources.
+     * Java 21 virtual threads park cheaply, so no such coupling is needed there.
+     */
+    private final ExecutorService transferExecutor;
+
+    public SftpFileCopy(SftpTransferProperties cfg, PooledSshClient sshPool) {
+        this.cfg             = cfg;
+        this.sshPool         = sshPool;
+        this.transferExecutor = Executors.newFixedThreadPool(cfg.sshPoolSize());
+        log.info("SftpFileCopy [Java 17] ready — sftp={} chunkSize={}MB poolSize={}",
+                cfg.enabled(), cfg.chunkSizeBytes() / (1024 * 1024), cfg.sshPoolSize());
+    }
+
+    // ── Sealed result hierarchy (GA since Java 17) ────────────────────────────
+
+    public sealed interface TransferResult
+            permits TransferResult.Success, TransferResult.Failure {
+
+        record Success(long     bytesTransferred,
+                       Duration elapsed,
+                       double   throughputMBps,
+                       String   transferId) implements TransferResult {}
+
+        record Failure(String    reason,
+                       Throwable cause,
+                       String    transferId) implements TransferResult {}
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    public TransferResult copyFile(String sourceFile,
+                                   String destinationPath,
+                                   String destinationFile) {
+
+        final String  transferId = UUID.randomUUID().toString();
+        final Instant start      = Instant.now();
+        final String  separator  = StringUtils.endsWith(destinationPath, File.separator)
+                ? "" : File.separator;
+
+        log.info("[{}] Transfer start — src={} dst={}/{}",
+                transferId, sourceFile, destinationPath, destinationFile);
+
+        return cfg.enabled()
+                ? transferViaSftp(sourceFile, destinationPath, destinationFile,
+                                  separator, transferId, start)
+                : transferLocal(sourceFile, destinationPath, destinationFile,
+                                separator, transferId, start);
+    }
+
+    // ── SFTP dispatch ─────────────────────────────────────────────────────────
+
+    private TransferResult transferViaSftp(String sourceFile,
+                                           String destinationPath,
+                                           String destinationFile,
+                                           String separator,
+                                           String transferId,
+                                           Instant start) {
+        Path sourcePath = Path.of(sourceFile);
+        long fileSize;
+        try {
+            fileSize = Files.size(sourcePath);
+        } catch (IOException ex) {
+            return new TransferResult.Failure("Cannot read source file size", ex, transferId);
+        }
+
+        String remoteDest = destinationPath + separator + destinationFile;
+
+        return cfg.requiresChunkedTransfer(fileSize)
+                ? chunkedParallelTransfer(sourcePath, fileSize, remoteDest, transferId, start)
+                : singleStreamTransfer(sourcePath, fileSize, remoteDest, transferId, start);
+    }
+
+    // ── Single-stream transfer ────────────────────────────────────────────────
+
+    private TransferResult singleStreamTransfer(Path    sourcePath,
+                                                long    fileSize,
+                                                String  remoteDest,
+                                                String  transferId,
+                                                Instant start) {
+        SSHClient  ssh  = null;
+        SFTPClient sftp = null;
+        try {
+            ssh  = sshPool.borrowClient();
+            sftp = ssh.newSFTPClient();
+
+            try (RemoteFile remoteFile = sftp.open(
+                         remoteDest, EnumSet.of(OpenMode.WRITE, OpenMode.CREAT));
+                 InputStream  in  = new BufferedInputStream(
+                         Files.newInputStream(sourcePath), cfg.bufferSizeBytes());
+                 OutputStream out = new BufferedOutputStream(
+                         remoteFile.new RemoteFileOutputStream(), cfg.bufferSizeBytes())) {
+
+                in.transferTo(out);   // InputStream.transferTo() — GA since Java 9
+                out.flush();
+            }
+
+            Duration elapsed = Duration.between(start, Instant.now());
+            log.info("[{}] Single-stream complete — {:.2f} MB/s",
+                    transferId, toMBps(fileSize, elapsed));
+            return new TransferResult.Success(
+                    fileSize, elapsed, toMBps(fileSize, elapsed), transferId);
+
+        } catch (Exception ex) {
+            log.error("[{}] Single-stream failed", transferId, ex);
+            return new TransferResult.Failure("SFTP single-stream error", ex, transferId);
+        } finally {
+            closeQuietly(sftp);
+            if (ssh != null) sshPool.returnClient(ssh);
+        }
+    }
+
+    // ── Chunked parallel transfer — Java 17 CompletableFuture ────────────────
+
+    /**
+     * Parallel chunk upload using {@link CompletableFuture} on a fixed thread pool.
+     *
+     * <h4>Failure handling vs Java 21</h4>
+     * <p>Java 21 {@code StructuredTaskScope.ShutdownOnFailure} cancels sibling
+     * virtual threads the instant any chunk throws.  Here the equivalent is:
+     * <ol>
+     *   <li>{@code CompletableFuture.allOf(...).get(totalTimeout)} blocks until
+     *       all futures complete <em>or</em> the deadline passes.</li>
+     *   <li>If {@code get()} throws (any future completed exceptionally),
+     *       {@code executor.shutdownNow()} interrupts all running chunk threads.</li>
+     *   <li>A second pass checks each future for exceptions via
+     *       {@link CompletableFuture#isCompletedExceptionally()}.</li>
+     * </ol>
+     *
+     * <h4>Timeout</h4>
+     * <p>A single wall-clock deadline — {@code timeoutPerChunkMinutes × chunkCount}
+     * — is passed to {@code allOf.get(timeout, unit)}, preserving the same
+     * single-deadline semantics as {@code scope.joinUntil(deadline)}.
+     */
+    private TransferResult chunkedParallelTransfer(Path    sourcePath,
+                                                   long    fileSize,
+                                                   String  remoteDest,
+                                                   String  transferId,
+                                                   Instant start) {
+        int        totalChunks   = cfg.chunkCount(fileSize);
+        long       totalTimeout  = cfg.timeoutPerChunkMinutes() * (long) totalChunks;
+        AtomicLong totalWritten  = new AtomicLong();
+
+        // ── Submit one task per chunk to the fixed platform-thread pool ───────
+        List<CompletableFuture<Void>> futures = new ArrayList<>(totalChunks);
+
+        for (int i = 0; i < totalChunks; i++) {
+            final int  idx    = i;
+            final long offset = (long) i * cfg.chunkSizeBytes();
+            final long length = cfg.chunkLength(i, totalChunks, fileSize);
+
+            CompletableFuture<Void> future = CompletableFuture.runAsync(
+                    () -> {
+                        try {
+                            transferChunk(sourcePath, remoteDest, idx,
+                                          offset, length, transferId, totalWritten);
+                        } catch (Exception ex) {
+                            // Wrap checked exception — runAsync requires Runnable
+                            throw new CompletionException(ex);
+                        }
+                    },
+                    transferExecutor);
+
+            futures.add(future);
+        }
+
+        // ── Wait for all chunks under a single wall-clock deadline ────────────
+        CompletableFuture<Void> allChunks =
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+
+        try {
+            allChunks.get(totalTimeout, TimeUnit.MINUTES);
+
+        } catch (TimeoutException ex) {
+            // Cancel remaining — best-effort interrupt of running platform threads
+            futures.forEach(f -> f.cancel(true));
+            log.error("[{}] Transfer deadline exceeded ({}m × {} chunks)",
+                    transferId, cfg.timeoutPerChunkMinutes(), totalChunks);
+            return new TransferResult.Failure("Transfer deadline exceeded", ex, transferId);
+
+        } catch (InterruptedException ex) {
+            futures.forEach(f -> f.cancel(true));
+            Thread.currentThread().interrupt();
+            return new TransferResult.Failure("Transfer interrupted", ex, transferId);
+
+        } catch (ExecutionException ex) {
+            // One or more chunks failed — cancel the rest
+            futures.forEach(f -> f.cancel(true));
+            log.error("[{}] Chunk failed — remaining chunks cancelled",
+                    transferId, ex.getCause());
+            return new TransferResult.Failure(
+                    "Chunk transfer failed", ex.getCause(), transferId);
+        }
+
+        // ── Verify no silent failures (non-exception path) ───────────────────
+        boolean anyFailed = futures.stream().anyMatch(CompletableFuture::isCompletedExceptionally);
+        if (anyFailed) {
+            log.warn("[{}] One or more chunks reported failure post-join", transferId);
+            return new TransferResult.Failure(
+                    "One or more chunks failed", null, transferId);
+        }
+
+        Duration elapsed = Duration.between(start, Instant.now());
+        double   mbps    = toMBps(fileSize, elapsed);
+        log.info("[{}] Chunked complete — {:.2f} MB/s over {} chunks",
+                transferId, mbps, totalChunks);
+        return new TransferResult.Success(fileSize, elapsed, mbps, transferId);
+    }
+
+    // ── One chunk — runs on a platform thread ─────────────────────────────────
+
+    /**
+     * Executes on a fixed platform thread from {@link #transferExecutor}.
+     *
+     * <p><b>Java 17 note:</b> platform threads block on every SFTP I/O call,
+     * holding their OS thread for the duration.  This is why the pool size
+     * must equal the SSH pool size — there is no lightweight parking.
+     * Java 21 virtual threads park the carrier thread during I/O, making
+     * large chunk counts far cheaper.
+     *
+     * @throws Exception re-thrown so {@link CompletableFuture} captures the failure
+     */
+    private void transferChunk(Path       sourcePath,
+                                String     remoteDest,
+                                int        chunkIndex,
+                                long       offset,
+                                long       length,
+                                String     transferId,
+                                AtomicLong totalWritten) throws Exception {
+        SSHClient  ssh  = null;
+        SFTPClient sftp = null;
+        try {
+            ssh  = sshPool.borrowClient();
+            sftp = ssh.newSFTPClient();
+
+            try (FileChannel  channel = FileChannel.open(sourcePath, StandardOpenOption.READ);
+                 RemoteFile   remote  = sftp.open(
+                         remoteDest,
+                         EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.APPEND));
+                 OutputStream out     = new BufferedOutputStream(
+                         remote.new RemoteFileOutputStream(offset), cfg.bufferSizeBytes())) {
+
+                java.nio.MappedByteBuffer mapped =
+                        channel.map(FileChannel.MapMode.READ_ONLY, offset, length);
+
+                byte[] buf       = new byte[cfg.bufferSizeBytes()];
+                long   remaining = length;
+
+                while (remaining > 0) {
+                    int batch = (int) Math.min(cfg.bufferSizeBytes(), remaining);
+                    mapped.get(buf, 0, batch);
+                    out.write(buf, 0, batch);
+                    totalWritten.addAndGet(batch);
+                    remaining -= batch;
+                }
+                out.flush();
+            }
+
+            log.info("[{}] Chunk {} done ({} MB)",
+                    transferId, chunkIndex, length / (1024 * 1024));
+
+        } finally {
+            closeQuietly(sftp);
+            if (ssh != null) {
+                sshPool.incrementUploadCount();
+                sshPool.returnClient(ssh);
+            }
+        }
+    }
+
+    // ── Local NIO2 fallback (cfg.enabled() == false) ──────────────────────────
+
+    private TransferResult transferLocal(String  sourceFile,
+                                         String  destinationPath,
+                                         String  destinationFile,
+                                         String  separator,
+                                         String  transferId,
+                                         Instant start) {
+        try {
+            Path src  = Path.of(sourceFile);
+            Path dest = Path.of(destinationPath + separator + destinationFile);
+            Files.createDirectories(dest.getParent());
+            long     written = Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
+            Duration elapsed = Duration.between(start, Instant.now());
+            return new TransferResult.Success(
+                    written, elapsed, toMBps(written, elapsed), transferId);
+        } catch (Exception ex) {
+            log.error("[{}] Local copy failed", transferId, ex);
+            return new TransferResult.Failure("Local copy error", ex, transferId);
+        }
+    }
+
+    // ── Utility ───────────────────────────────────────────────────────────────
+
+    private static double toMBps(long bytes, Duration elapsed) {
+        return (bytes / (1024.0 * 1024.0)) / Math.max(elapsed.toMillis() / 1000.0, 0.001);
+    }
+
+    private void closeQuietly(Closeable c) {
+        if (c != null) try { c.close(); } catch (IOException ignored) {}
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    @jakarta.annotation.PreDestroy
+    public void shutdown() {
+        log.info("SftpFileCopy [Java 17] shutdown — waiting {}m for in-flight transfers",
+                cfg.executorShutdownTimeoutMinutes());
+        transferExecutor.shutdown();
+        try {
+            if (!transferExecutor.awaitTermination(
+                    cfg.executorShutdownTimeoutMinutes(), TimeUnit.MINUTES)) {
+                transferExecutor.shutdownNow();
+            }
+        } catch (InterruptedException ex) {
+            transferExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+
+
+
+
+
