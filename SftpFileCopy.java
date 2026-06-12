@@ -1,50 +1,42 @@
- /**
-     * Streams source -> destination, resuming from a partial destination if one exists.
+**
+     * Returns the byte offset to resume from: the size of an existing partial
+     * destination, or 0 for a fresh transfer. A destination larger than the
+     * source is stale garbage — restart from zero (with TRUNC).
      */
-    private boolean streamCopyWithResume(PooledSshClient readerClient,
-                                         PooledSshClient writerClient,
-                                         String sourceFile, String destination,
-                                         long setupMillis) {
-        try (SFTPClient reader = readerClient.newSFTPClient();
-             SFTPClient writer = writerClient.newSFTPClient()) {
- 
-            long sourceSize = reader.stat(sourceFile).getSize();
-            long resumeOffset = resolveResumeOffset(writer, destination, sourceSize);
- 
-            if (resumeOffset == sourceSize) {
-                log.info("Destination already complete ({} bytes), skipping copy", sourceSize);
-                return true;
+    private long resolveResumeOffset(SFTPClient writer, String destination, long sourceSize) {
+        try {
+            FileAttributes attrs = writer.statExistence(destination);
+            if (attrs == null) {
+                return 0;
             }
-            if (resumeOffset > 0) {
-                log.info("Resuming transfer at offset {} of {} ({}%)",
-                        resumeOffset, sourceSize, (resumeOffset * 100) / sourceSize);
+            long existing = attrs.getSize();
+            if (existing > sourceSize) {
+                log.warn("Destination ({} bytes) larger than source ({} bytes) — restarting",
+                        existing, sourceSize);
+                return 0;
             }
- 
-            // No TRUNC when resuming — we append from the offset.
-            EnumSet<OpenMode> writeModes = resumeOffset > 0
-                    ? EnumSet.of(OpenMode.WRITE, OpenMode.CREAT)
-                    : EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.TRUNC);
- 
-            try (RemoteFile src = reader.open(sourceFile, EnumSet.of(OpenMode.READ));
-                 RemoteFile dst = writer.open(destination, writeModes);
-                 // SFTP reads are offset-addressed: starting the stream AT the resume
-                 // offset means the resumed bytes are never re-downloaded. The old
-                 // skipFully() approach pulled them all through the network to discard.
-                 InputStream in = src.new ReadAheadRemoteFileInputStream(
-                         READ_AHEAD_REQUESTS, resumeOffset);
-                 OutputStream out = dst.new RemoteFileOutputStream(resumeOffset, READ_AHEAD_REQUESTS)) {
- 
-                long transferStart = System.nanoTime();
-                long transferred = transfer(in, out);
-                long transferMillis = (System.nanoTime() - transferStart) / 1_000_000;
- 
-                logTransferMetrics("stream", sourceFile, destination,
-                        transferred, setupMillis, transferMillis, resumeOffset);
-                return true;
+            if (existing < RESUME_THRESHOLD_BYTES) {
+                return 0; // cheaper to re-copy small partials than to resume
             }
+            return existing;
         } catch (IOException e) {
-            log.error("Error trying to SFTP copy source file: {} to destination file: {}",
-                    sourceFile, destination, e);
-            return false;
+            log.warn("Could not stat destination for resume check, starting fresh", e);
+            return 0;
         }
+    }
+ 
+    /**
+     * Copies all bytes using a {@link #BUFFER_SIZE} buffer — ~16x fewer loop
+     * iterations than transferTo()'s 8–16 KB internal buffer, and each read()
+     * drains multiple prefetched packets from the read-ahead stream.
+     */
+    private static long transfer(InputStream in, OutputStream out) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        long total = 0;
+        int read;
+        while ((read = in.read(buffer)) > 0) {
+            out.write(buffer, 0, read);
+            total += read;
+        }
+        return total;
     }
