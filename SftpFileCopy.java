@@ -1,43 +1,17 @@
 /**
- * Return an existing sequenceIndex for a realPan, or atomically generate,
- * record (new->original mapping), and cache a new one. Same realPan returns
- * the same sequenceIndex for the life of the job (per csvPath). Thread-safe.
+ * Substitute the account number in a single serialized |AC| row with a
+ * job-wide consistent sequenceIndex, WITHOUT mutating any DTO.
  *
- * Records the new->original mapping exactly once per unique PAN — this is
- * what Stage 5 (ShipfileBuilderImpl) consumes to rebuild the plain PAN map.
+ * Anchors on the "AC" token. acctNum is 3 tokens after "AC"
+ * (AC | subId | ref | acctNum), which is correct for BOTH the
+ * "cfid||TD|fid|AC|..." notification rows and the "cfid|fid|AC|..."
+ * consumer rows because we anchor on "AC", not on a fixed column.
  *
- * @param csvPath       absolute path to the .encPan.csv file
- * @param realPan       real account number (caller trims)
- * @param originalIndex original input INDEX from reverseMap (non-null)
- * @param fieldLength   account field length for zero-padding
- * @return sequenceIndex (existing or new)
- */
-public static String getOrCreateSeqIndex(String csvPath, String realPan,
-        String originalIndex, int fieldLength) {
-
-    ConcurrentHashMap<String, String> panMap =
-            PAN_TO_SEQ_INDEX_CACHE.computeIfAbsent(csvPath, k -> new ConcurrentHashMap<>());
-
-    return panMap.computeIfAbsent(realPan, p -> {
-        String seqIndex = nextSequentialIndex(csvPath, fieldLength);
-        addNewToOriginalMapping(csvPath, seqIndex, originalIndex);
-        return seqIndex;
-    });
-}
-
-PAN_TO_SEQ_INDEX_CACHE.remove(csvPath);
-
-PAN_TO_SEQ_INDEX_CACHE.clear();
-
-
-//PanRestorationHelper.java
-/**
- * Substitute the account number in a serialized |AC| row with a job-wide
- * consistent sequenceIndex, WITHOUT mutating any DTO. Operates on the
- * serialized string so the in-memory IndicAccountDto (shared with DB
- * persistence and scoring) keeps its realPan.
- *
- * acctNum is IndicAccountDto parts[4] => 5 tokens after the "AC" token.
+ * @param row         serialized consumer row (single line)
+ * @param reverseMap  realPan -> originalIndex
+ * @param csvPath     absolute path to the .encPan.csv file
+ * @param fieldLength account field length for padding
+ * @return row with acctNum replaced by sequenceIndex, or unchanged row
  */
 public static String substituteAcctNumInRow(String row,
         Map<String, String> reverseMap, String csvPath, int fieldLength) {
@@ -46,24 +20,35 @@ public static String substituteAcctNumInRow(String row,
             || !row.contains("|AC|")) {
         return row;
     }
+
     String[] cols = row.split("\\|", -1);
 
     int acIdx = -1;
     for (int i = 0; i < cols.length; i++) {
-        if ("AC".equals(cols[i].trim())) { acIdx = i; break; }
+        if ("AC".equals(cols[i].trim())) {
+            acIdx = i;
+            break;
+        }
     }
-    if (acIdx == -1) return row;
+    if (acIdx == -1) {
+        return row;
+    }
 
-    int acctNumIdx = acIdx + 5;
-    if (acctNumIdx >= cols.length) return row;
+    // AC | subId | ref | acctNum  =>  acctNum at acIdx + 3
+    int acctNumIdx = acIdx + 3;
+    if (acctNumIdx >= cols.length) {
+        return row;
+    }
 
     String acctNum = cols[acctNumIdx].trim();
-    if (acctNum.isEmpty()) return row;
+    if (acctNum.isEmpty()) {
+        return row;
+    }
 
     String originalIndex = reverseMap.get(acctNum);
     if (originalIndex == null) {
-        log.warn("acctNum [{}] not in reverseMap for [{}]; row left unsubstituted "
-                + "(realPan remains in .txt)", acctNum, csvPath);
+        log.warn("acctNum [{}] not in reverseMap for [{}]; row left "
+                + "unsubstituted (realPan remains in .txt)", acctNum, csvPath);
         return row;
     }
 
@@ -73,76 +58,65 @@ public static String substituteAcctNumInRow(String row,
     int padLen = cols[acctNumIdx].length();
     cols[acctNumIdx] = String.format("%-" + padLen + "s", seqIndex);
 
-    log.debug("txt: realPan [{}] -> seqIndex [{}] col [{}]", acctNum, seqIndex, acctNumIdx);
+    log.debug("txt: realPan [{}] -> seqIndex [{}] col [{}]",
+            acctNum, seqIndex, acctNumIdx);
+
     return String.join("|", cols);
 }
 
 /**
- * Resolve seqIndex back to realPan on the in-memory DTOs, so Stage 4 scoring
- * (which REQUIRES realPan) works after reading a .txt that carries seqIndex.
- * DTOs are later re-substituted to seqIndex for the .out file.
+ * Substitute the account number in every |AC| line within a multi-line
+ * block (e.g. the output of TriggeredResultWrapper.toString, which emits
+ * the ||TD| notification rows). Non-AC lines are left untouched.
+ * Preserves original line separators (handles \n and \r\n).
  *
- * seqIndex -> originalIndex (NEW_TO_ORIGINAL_INDEX_CACHE)
- * originalIndex -> realPan  (FORWARD_CACHE)
+ * @param block       multi-line serialized block
+ * @param reverseMap  realPan -> originalIndex
+ * @param csvPath     absolute path to the .encPan.csv file
+ * @param fieldLength account field length for padding
+ * @return block with all AC-row acctNums substituted
  */
-public static void resolveSeqIndexToRealPan(List<IndicBaseDto> dtos, String csvPath) {
-    if (dtos == null || csvPath == null) return;
-
-    Map<String, String> newToOriginal = PanSubstitutionService.getNewToOriginalMap(csvPath);
-    Map<String, String> forwardMap     = PanSubstitutionService.getForwardMap(csvPath);
-    if (newToOriginal == null || newToOriginal.isEmpty()
-            || forwardMap == null || forwardMap.isEmpty()) {
-        log.warn("missing seq->orig / forward maps for [{}]; cannot resolve realPan "
-                + "for scoring — scores may be incorrect", csvPath);
-        return;
-    }
-
-    for (IndicBaseDto dto : dtos) {
-        if (dto instanceof IndicAccountDto) {
-            IndicAccountDto acct = (IndicAccountDto) dto;
-            String seqIndex = acct.getAcctNum();
-            if (seqIndex == null || seqIndex.trim().isEmpty()) continue;
-
-            String originalIndex = newToOriginal.get(seqIndex.trim());
-            if (originalIndex == null) continue;
-
-            String realPan = forwardMap.get(originalIndex);
-            if (realPan != null) {
-                acct.setAcctNum(realPan);   // in-memory only, for scoring
-                log.debug("resolved seqIndex [{}] -> realPan for scoring", seqIndex);
-            }
-        }
-    }
-}
-
-public static void restoreIndicDtoList(List<IndicBaseDto> dtos,
+public static String substituteAcLinesInBlock(String block,
         Map<String, String> reverseMap, String csvPath, int fieldLength) {
 
-    if (dtos == null || reverseMap == null || reverseMap.isEmpty()) return;
-
-    for (IndicBaseDto dto : dtos) {
-        if (dto instanceof IndicAccountDto) {
-            IndicAccountDto acct = (IndicAccountDto) dto;
-            String acctNum = acct.getAcctNum();
-            if (acctNum == null || acctNum.trim().isEmpty()) continue;
-
-            String pan = acctNum.trim();
-            String originalIndex = reverseMap.get(pan);
-            if (originalIndex != null) {
-                String seqIndex = PanSubstitutionService.getOrCreateSeqIndex(
-                        csvPath, pan, originalIndex, fieldLength);  // cache HIT = same as .txt
-                acct.setAcctNum(seqIndex);
-            }
-        }
+    if (block == null || block.isEmpty() || !block.contains("|AC|")) {
+        return block;
     }
+
+    StringBuilder out = new StringBuilder(block.length() + 16);
+    int start = 0;
+    int len = block.length();
+
+    while (start < len) {
+        int nl = block.indexOf('\n', start);
+        int lineEnd = (nl < 0) ? len : nl;
+
+        int contentEnd = lineEnd;
+        boolean hasCr = (contentEnd > start && block.charAt(contentEnd - 1) == '\r');
+        if (hasCr) {
+            contentEnd--;
+        }
+
+        String line = block.substring(start, contentEnd);
+
+        if (line.contains("|AC|")) {
+            line = substituteAcctNumInRow(line, reverseMap, csvPath, fieldLength);
+        }
+
+        out.append(line);
+        if (hasCr) {
+            out.append('\r');
+        }
+        if (nl >= 0) {
+            out.append('\n');
+        }
+
+        start = (nl < 0) ? len : nl + 1;
+    }
+
+    return out.toString();
 }
 
-// inside restoreConsumerRow, replace the index-generation block with:
-String newIndex = PanSubstitutionService.getOrCreateSeqIndex(
-        csvPath, realPan, originalIndex, accountLength);
-// (removes the separate nextSequentialIndex + addNewToOriginalMapping calls)
-
-//SaveTriggeredConsumerDataImpl.java
 public void saveConsumerData(ChunkMessage cm,
         Map<Integer, List<FiredTriggerResult>> firedTriggerMap,
         Map<Integer, List<IndicBaseDto>> fidMap) throws TucException {
@@ -150,6 +124,7 @@ public void saveConsumerData(ChunkMessage cm,
     Object fileHandle = null;
     String lineseperator = System.getProperty("line.separator");
 
+    // ── PAN substitution setup (cached per job; cheap after first chunk) ──
     String encPanCsvPath = resolveEncPanCsvPath(cm);
     Map<String, String> reverseMap = null;
     int fieldLengthRp3 = 16;
@@ -157,8 +132,11 @@ public void saveConsumerData(ChunkMessage cm,
         PanSubstitutionService panService = new PanSubstitutionService(
                 new EncPanCsvReader(), PanDecryptServiceHolder.getInstance());
         reverseMap = panService.loadReverseMap(encPanCsvPath);
+
         int[] acctFieldRp3 = PanSubstitutionService.getAccountFieldInfo(encPanCsvPath);
-        if (acctFieldRp3 != null) fieldLengthRp3 = acctFieldRp3[1];
+        if (acctFieldRp3 != null) {
+            fieldLengthRp3 = acctFieldRp3[1];
+        }
     }
     boolean doSubstitute = (reverseMap != null && !reverseMap.isEmpty());
     if (!doSubstitute && encPanCsvPath != null) {
@@ -177,6 +155,7 @@ public void saveConsumerData(ChunkMessage cm,
 
         for (Iterator<Integer> it = firedTriggerMap.keySet().iterator(); it.hasNext(); ) {
             Integer cfid = it.next();
+
             List<IndicBaseDto> dtos = fidMap.get(cfid);
             List<FiredTriggerResult> results = firedTriggerMap.get(cfid);
 
@@ -185,73 +164,55 @@ public void saveConsumerData(ChunkMessage cm,
 
             stuff.append(scfid).append("||A0").append(lineseperator);
 
+            // ── Block A: triggered notification rows (||TD|) ──
             TriggeredResultWrapper trw = new TriggeredResultWrapper();
             for (FiredTriggerResult result : results) {
-                stuff.append(trw.toString(scfid, result));
+                String trigBlock = trw.toString(scfid, result);
+
+                if (doSubstitute && trigBlock.contains("|AC|")) {
+                    trigBlock = PanRestorationHelper.substituteAcLinesInBlock(
+                            trigBlock, reverseMap, encPanCsvPath, fieldLengthRp3);
+                }
+
+                stuff.append(trigBlock);
             }
 
+            // ── Block B: consumer DTO rows (single-pipe) ──
             for (IndicBaseDto dto : dtos) {
                 String line = scfid + "|" + dto.toString();   // DTO NOT mutated
+
                 if (doSubstitute) {
                     line = PanRestorationHelper.substituteAcctNumInRow(
                             line, reverseMap, encPanCsvPath, fieldLengthRp3);
                 }
+
                 stuff.append(line).append(lineseperator);
             }
 
+            // terminator
             stuff.append(scfid).append("||ZZ").append(lineseperator);
+
             fileio.writePerson(fileHandle, stuff.toString());
         }
+
     } catch (Exception e) {
         log.error(e.getMessage(), e);
     } finally {
-        if (fileHandle != null) fileio.close(fileHandle);
-    }
-}
-
-private String resolveEncPanCsvPath(ChunkMessage cm) {
-    String csvPath = PanSubstitutionService.getCompanyCsvPath(cm.getCompany());
-    if (csvPath == null) return null;
-    File csvFile = new File(csvPath);
-    return csvFile.exists() ? csvPath : null;
-}
-
-//WorkerFullfill.java
-private void processDtoSegments(EntityManager em, Counts counts,
-        ChunkMessage cm, Object fileHandleInput, String fileName) {
-    try {
-        String encPanCsvPath = resolveEncPanCsvPath(cm);
-
-        List<Object> dtoSegments;
-        while (((dtoSegments = fileio.readPerson(fileHandleInput)) != null)
-                && (!dtoSegments.isEmpty())) {
-
-            em.getTransaction().begin();
-            counts.persons++;
-
-            // .txt carries seqIndex; restore realPan for scoring (Stage 4 needs it)
-            if (encPanCsvPath != null) {
-                List<IndicBaseDto> indicDtos = ListDtoHelper.getByType(
-                        dtoSegments, "ca.tuc.commons.dto.schema.indic.IndicBaseDto");
-                PanRestorationHelper.resolveSeqIndexToRealPan(indicDtos, encPanCsvPath);
-            }
-
-            processFullfiller(cm, dtoSegments, counts, em);
-            postBilling(cm, dtoSegments);
-            postInquiry(cm, dtoSegments);
-            counts.inquiryCount++;
-            em.getTransaction().commit();
+        if (fileHandle != null) {
+            fileio.close(fileHandle);
         }
-    } catch (Exception e) {
-        log.error(StringEscapeUtils.escapeJava(
-            "Problem while processing file [" + fileName + "] "), e);
-        em.getTransaction().rollback();
     }
 }
 
+/**
+ * Derive the .encPan.csv path from the chunk message.
+ * @return absolute path to the .encPan.csv file, or null if it doesn't exist
+ */
 private String resolveEncPanCsvPath(ChunkMessage cm) {
     String csvPath = PanSubstitutionService.getCompanyCsvPath(cm.getCompany());
-    if (csvPath == null) return null;
+    if (csvPath == null) {
+        return null;
+    }
     File csvFile = new File(csvPath);
     return csvFile.exists() ? csvPath : null;
 }
