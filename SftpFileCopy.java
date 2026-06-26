@@ -1,1 +1,1 @@
-The value written at line 95 is AES ciphertext produced by encryptor.encrypt(), not plaintext PAN. encryptAll's purpose is to encrypt PAN values before they are written to the output CSV; emitting ciphertext is the intended PCI-compliant behavior. No cleartext personal data crosses the application boundary. (Checkmarx tracks PAN data lineage but does not recognize the encryption step as a sanitizer.
+
