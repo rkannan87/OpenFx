@@ -1,0 +1,136 @@
+import com.sun.jna.Native;
+import com.sun.jna.platform.win32.User32;
+import com.sun.jna.platform.win32.WinDef.HWND;
+import com.sun.jna.platform.win32.WinUser;
+
+import java.awt.AWTException;
+import java.awt.Robot;
+import java.awt.event.KeyEvent;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * IeTabRefresher
+ *
+ * Finds an Internet Explorer window by a substring in its title bar,
+ * brings it to the foreground, and sends F5 to refresh it every 15 minutes.
+ *
+ * IMPORTANT LIMITATION:
+ * Old-style IE windows show a title only for the currently ACTIVE tab.
+ * F5 refreshes whichever tab is active in that window at the moment this
+ * runs — it cannot target a background tab that isn't currently focused
+ * inside the IE window. If you need to hit a specific background tab,
+ * you'd need Selenium/IEDriverServer instead (controls tabs directly,
+ * not via window title/keystrokes).
+ *
+ * REQUIRES: JNA + JNA-Platform on the classpath.
+ * Maven dependencies:
+ *   <dependency>
+ *     <groupId>net.java.dev.jna</groupId>
+ *     <artifactId>jna-platform</artifactId>
+ *     <version>5.14.0</version>
+ *   </dependency>
+ *
+ * Run directly in IntelliJ: right-click -> Run 'IeTabRefresher.main()'
+ * Windows only (uses User32 window enumeration).
+ */
+public class IeTabRefresher {
+
+    // Substring to match in the IE window title bar (e.g. part of the page title or site name)
+    private static final String TARGET_TITLE_SUBSTRING = "YourTabTitleHere";
+
+    private static final long INTERVAL_MINUTES = 15;
+
+    private static final DateTimeFormatter TIME_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    public static void main(String[] args) {
+        Robot robot;
+        try {
+            robot = new Robot();
+        } catch (AWTException e) {
+            System.err.println("Unable to initialize Robot: " + e.getMessage());
+            return;
+        }
+
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "ie-refresh-thread");
+            t.setDaemon(true);
+            return t;
+        });
+
+        System.out.println("IeTabRefresher started. Looking for window containing: \""
+                + TARGET_TITLE_SUBSTRING + "\". Refreshing every " + INTERVAL_MINUTES
+                + " minute(s). Press Ctrl+C to stop.");
+
+        Runnable refreshTask = () -> {
+            HWND hwnd = findWindowByTitleSubstring(TARGET_TITLE_SUBSTRING);
+            String timestamp = LocalDateTime.now().format(TIME_FORMAT);
+
+            if (hwnd == null) {
+                System.out.println("[" + timestamp + "] No matching IE window found (\""
+                        + TARGET_TITLE_SUBSTRING + "\"). Skipping this cycle.");
+                return;
+            }
+
+            boolean brought = User32.INSTANCE.SetForegroundWindow(hwnd);
+            if (!brought) {
+                System.out.println("[" + timestamp + "] Found window but could not bring it "
+                        + "to foreground (it may be minimized or blocked by Windows focus rules).");
+            }
+
+            try {
+                // Small pause to let the window actually gain focus before sending the key
+                Thread.sleep(300);
+            } catch (InterruptedException ignored) {
+            }
+
+            robot.keyPress(KeyEvent.VK_F5);
+            robot.keyRelease(KeyEvent.VK_F5);
+
+            System.out.println("[" + timestamp + "] F5 sent to matched IE window.");
+        };
+
+        scheduler.scheduleAtFixedRate(refreshTask, 0, INTERVAL_MINUTES, TimeUnit.MINUTES);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutting down IeTabRefresher.");
+            scheduler.shutdownNow();
+        }));
+
+        try {
+            Thread.currentThread().join();
+        } catch (InterruptedException ignored) {
+        }
+    }
+
+    /**
+     * Enumerates all top-level windows and returns the first one whose title
+     * contains the given substring (case-insensitive) and looks like an IE window.
+     */
+    private static HWND findWindowByTitleSubstring(String substring) {
+        AtomicReference<HWND> found = new AtomicReference<>();
+        String needle = substring.toLowerCase();
+
+        User32.INSTANCE.EnumWindows((hWnd, data) -> {
+            char[] buffer = new char[1024];
+            User32.INSTANCE.GetWindowText(hWnd, buffer, buffer.length);
+            String title = Native.toString(buffer);
+
+            if (!title.isEmpty() && title.toLowerCase().contains(needle)) {
+                // IE window titles typically end with "- Internet Explorer"
+                if (title.toLowerCase().contains("internet explorer") || title.toLowerCase().contains(needle)) {
+                    found.set(hWnd);
+                    return false; // stop enumeration, match found
+                }
+            }
+            return true; // keep enumerating
+        }, null);
+
+        return found.get();
+    }
+}
