@@ -1,136 +1,128 @@
-import com.sun.jna.Native;
-import com.sun.jna.platform.win32.User32;
-import com.sun.jna.platform.win32.WinDef.HWND;
-import com.sun.jna.platform.win32.WinUser;
+package org.example;
 
-import java.awt.AWTException;
-import java.awt.Robot;
+import java.awt.*;
 import java.awt.event.KeyEvent;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.Random;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * IeTabRefresher
- *
- * Finds an Internet Explorer window by a substring in its title bar,
- * brings it to the foreground, and sends F5 to refresh it every 15 minutes.
- *
- * IMPORTANT LIMITATION:
- * Old-style IE windows show a title only for the currently ACTIVE tab.
- * F5 refreshes whichever tab is active in that window at the moment this
- * runs — it cannot target a background tab that isn't currently focused
- * inside the IE window. If you need to hit a specific background tab,
- * you'd need Selenium/IEDriverServer instead (controls tabs directly,
- * not via window title/keystrokes).
- *
- * REQUIRES: JNA + JNA-Platform on the classpath.
- * Maven dependencies:
- *   <dependency>
- *     <groupId>net.java.dev.jna</groupId>
- *     <artifactId>jna-platform</artifactId>
- *     <version>5.14.0</version>
- *   </dependency>
- *
- * Run directly in IntelliJ: right-click -> Run 'IeTabRefresher.main()'
- * Windows only (uses User32 window enumeration).
- */
-public class IeTabRefresher {
+public class Main {
 
-    // Substring to match in the IE window title bar (e.g. part of the page title or site name)
-    private static final String TARGET_TITLE_SUBSTRING = "YourTabTitleHere";
-
-    private static final long INTERVAL_MINUTES = 15;
-
-    private static final DateTimeFormatter TIME_FORMAT =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final int DEFAULT_INTERVAL_MINUTES = 2;
+    private static final Random random = new Random();
+    private static Robot robot;
 
     public static void main(String[] args) {
-        Robot robot;
         try {
+            int intervalMinutes = DEFAULT_INTERVAL_MINUTES;
+
+            if (args.length > 0) {
+                try {
+                    intervalMinutes = Integer.parseInt(args[0]);
+                    if (intervalMinutes < 1) {
+                        System.out.println("Interval must be at least 1 minute. Using default: " + DEFAULT_INTERVAL_MINUTES);
+                        intervalMinutes = DEFAULT_INTERVAL_MINUTES;
+                    }
+                } catch (NumberFormatException e) {
+                    System.out.println("Invalid interval. Using default: " + DEFAULT_INTERVAL_MINUTES + " minutes");
+                }
+            }
+
             robot = new Robot();
+
+            System.out.println("=== Keep MS Teams Active ===");
+            System.out.println("Activity interval: " + intervalMinutes + " minute(s)");
+            System.out.println("Program started at: " + new java.util.Date());
+            System.out.println("Press Ctrl+C to stop");
+            System.out.println("============================\n");
+
+            long intervalMillis = TimeUnit.MINUTES.toMillis(intervalMinutes);
+            int activityCount = 0;
+
+            while (true) {
+                activityCount++;
+                performActivity(activityCount);
+
+                System.out.println("Next activity in " + intervalMinutes + " minute(s)...\n");
+                Thread.sleep(intervalMillis);
+            }
+
         } catch (AWTException e) {
-            System.err.println("Unable to initialize Robot: " + e.getMessage());
-            return;
-        }
-
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "ie-refresh-thread");
-            t.setDaemon(true);
-            return t;
-        });
-
-        System.out.println("IeTabRefresher started. Looking for window containing: \""
-                + TARGET_TITLE_SUBSTRING + "\". Refreshing every " + INTERVAL_MINUTES
-                + " minute(s). Press Ctrl+C to stop.");
-
-        Runnable refreshTask = () -> {
-            HWND hwnd = findWindowByTitleSubstring(TARGET_TITLE_SUBSTRING);
-            String timestamp = LocalDateTime.now().format(TIME_FORMAT);
-
-            if (hwnd == null) {
-                System.out.println("[" + timestamp + "] No matching IE window found (\""
-                        + TARGET_TITLE_SUBSTRING + "\"). Skipping this cycle.");
-                return;
-            }
-
-            boolean brought = User32.INSTANCE.SetForegroundWindow(hwnd);
-            if (!brought) {
-                System.out.println("[" + timestamp + "] Found window but could not bring it "
-                        + "to foreground (it may be minimized or blocked by Windows focus rules).");
-            }
-
-            try {
-                // Small pause to let the window actually gain focus before sending the key
-                Thread.sleep(300);
-            } catch (InterruptedException ignored) {
-            }
-
-            robot.keyPress(KeyEvent.VK_F5);
-            robot.keyRelease(KeyEvent.VK_F5);
-
-            System.out.println("[" + timestamp + "] F5 sent to matched IE window.");
-        };
-
-        scheduler.scheduleAtFixedRate(refreshTask, 0, INTERVAL_MINUTES, TimeUnit.MINUTES);
-
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down IeTabRefresher.");
-            scheduler.shutdownNow();
-        }));
-
-        try {
-            Thread.currentThread().join();
-        } catch (InterruptedException ignored) {
+            System.err.println("Error: Unable to create Robot instance");
+            System.err.println("Make sure you have the necessary permissions");
+            e.printStackTrace();
+        } catch (InterruptedException e) {
+            System.out.println("\nProgram interrupted. Exiting...");
         }
     }
 
     /**
-     * Enumerates all top-level windows and returns the first one whose title
-     * contains the given substring (case-insensitive) and looks like an IE window.
+     * Performs simulated user activity
      */
-    private static HWND findWindowByTitleSubstring(String substring) {
-        AtomicReference<HWND> found = new AtomicReference<>();
-        String needle = substring.toLowerCase();
+    private static void performActivity(int count) {
+        System.out.println("[" + new java.util.Date() + "] Activity #" + count);
 
-        User32.INSTANCE.EnumWindows((hWnd, data) -> {
-            char[] buffer = new char[1024];
-            User32.INSTANCE.GetWindowText(hWnd, buffer, buffer.length);
-            String title = Native.toString(buffer);
+        // Randomly choose activity type
+        int activityType = random.nextInt(3);
 
-            if (!title.isEmpty() && title.toLowerCase().contains(needle)) {
-                // IE window titles typically end with "- Internet Explorer"
-                if (title.toLowerCase().contains("internet explorer") || title.toLowerCase().contains(needle)) {
-                    found.set(hWnd);
-                    return false; // stop enumeration, match found
-                }
-            }
-            return true; // keep enumerating
-        }, null);
+        switch (activityType) {
+            case 0:
+                moveMouseRandomly();
+                break;
+            case 1:
+                pressShiftKey();
+                break;
+            case 2:
+                moveMouseAndPressKey();
+                break;
+        }
+    }
 
-        return found.get();
+    private static void moveMouseRandomly() {
+        System.out.println("Action: Moving mouse randomly");
+
+        Point currentPos = MouseInfo.getPointerInfo().getLocation();
+        int startX = currentPos.x;
+        int startY = currentPos.y;
+
+        for (int i = 0; i < 4; i++) {
+            int offsetX = random.nextInt(100) - 50;
+            int offsetY = random.nextInt(100) - 50;
+
+            robot.mouseMove(startX + offsetX, startY + offsetY);
+            robot.delay(100);
+        }
+
+        robot.mouseMove(startX, startY);
+        System.out.println("Mouse movement completed");
+    }
+
+    private static void pressShiftKey() {
+        System.out.println("Action: Pressing Shift key");
+
+        robot.keyPress(KeyEvent.VK_SHIFT);
+        robot.delay(50);
+        robot.keyRelease(KeyEvent.VK_SHIFT);
+
+        System.out.println("Shift key pressed");
+    }
+
+    private static void moveMouseAndPressKey() {
+        System.out.println("Action: Moving mouse + pressing key");
+
+        Point currentPos = MouseInfo.getPointerInfo().getLocation();
+
+        robot.mouseMove(currentPos.x + 10, currentPos.y + 10);
+        robot.delay(50);
+        robot.mouseMove(currentPos.x, currentPos.y);
+
+        robot.keyPress(KeyEvent.VK_SCROLL_LOCK);
+        robot.delay(50);
+        robot.keyRelease(KeyEvent.VK_SCROLL_LOCK);
+        robot.delay(50);
+        robot.keyPress(KeyEvent.VK_SCROLL_LOCK);
+        robot.delay(50);
+        robot.keyRelease(KeyEvent.VK_SCROLL_LOCK);
+
+        System.out.println("Combined activity completed");
     }
 }
