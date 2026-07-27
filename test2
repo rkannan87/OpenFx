@@ -1,0 +1,60 @@
+# /etc/httpd/conf.d/ssl.conf
+
+Listen 443 https
+
+# Shared session cache across worker processes (recommended, not strictly required)
+SSLSessionCache        shmcb:/run/httpd/sslcache(512000)
+SSLSessionCacheTimeout 300
+
+##
+## VirtualHost for HTTPS
+##
+<VirtualHost *:443>
+    ServerName yourdomain.com
+    ServerAlias www.yourdomain.com
+    DocumentRoot /var/www/html
+
+    ErrorLog logs/ssl_error_log
+    TransferLog logs/ssl_access_log
+    LogLevel warn
+
+    # ---- SSL Engine ----
+    SSLEngine on
+
+    # ---- Certificate: leaf cert + Issuing CA + Policy CA, in that order ----
+    SSLCertificateFile    /etc/httpd/ssl/fullchain.crt
+    SSLCertificateKeyFile /etc/httpd/ssl/server.key
+
+    # ---- Protocol / Cipher hardening (PCI DSS 4.0 compliant) ----
+    SSLProtocol -all +TLSv1.2 +TLSv1.3
+    SSLCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305
+    SSLHonorCipherOrder on
+
+    # ---- HSTS ----
+    Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains"
+
+    <Directory "/var/www/html">
+        Options -Indexes +FollowSymLinks
+        AllowOverride None
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+##
+## Redirect HTTP -> HTTPS
+##
+<VirtualHost *:80>
+    ServerName yourdomain.com
+    ServerAlias www.yourdomain.com
+    Redirect permanent / https://yourdomain.com/
+</VirtualHost>
+
+## Build the fullchain and set permissions
+cat server.crt IssuingCA.crt PolicyCA.crt > /etc/httpd/ssl/fullchain.crt
+chmod 644 /etc/httpd/ssl/fullchain.crt
+chmod 600 /etc/httpd/ssl/server.key
+chown root:root /etc/httpd/ssl/*
+
+## Test and reload
+sudo apachectl configtest
+sudo systemctl restart httpd
