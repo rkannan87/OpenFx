@@ -1,128 +1,83 @@
-package org.example;
-
-import java.awt.*;
-import java.awt.event.KeyEvent;
-import java.util.Random;
+import java.awt.AWTException;
+import java.awt.MouseInfo;
+import java.awt.Point;
+import java.awt.Robot;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-public class Main {
+/**
+ * SystemActivityKeeper
+ *
+ * Keeps the system (and any active browser window) from going idle by
+ * nudging the mouse cursor by a tiny amount at a fixed interval.
+ * This resets OS idle timers, which typically prevents:
+ *   - screen lock / screensaver activation
+ *   - "Away" status in apps like Teams
+ *   - browser tab throttling tied to window focus/activity
+ *
+ * Run directly in IntelliJ: right-click -> Run 'SystemActivityKeeper.main()'
+ */
+public class SystemActivityKeeper {
 
-    private static final int DEFAULT_INTERVAL_MINUTES = 2;
-    private static final Random random = new Random();
-    private static Robot robot;
+    // Interval between nudges, in minutes
+    private static final long INTERVAL_MINUTES = 5;
+
+    // How far (in pixels) to move the mouse and back. Small enough to be unnoticeable.
+    private static final int NUDGE_PIXELS = 1;
+
+    private static final DateTimeFormatter TIME_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     public static void main(String[] args) {
+        Robot robot;
         try {
-            int intervalMinutes = DEFAULT_INTERVAL_MINUTES;
-
-            if (args.length > 0) {
-                try {
-                    intervalMinutes = Integer.parseInt(args[0]);
-                    if (intervalMinutes < 1) {
-                        System.out.println("Interval must be at least 1 minute. Using default: " + DEFAULT_INTERVAL_MINUTES);
-                        intervalMinutes = DEFAULT_INTERVAL_MINUTES;
-                    }
-                } catch (NumberFormatException e) {
-                    System.out.println("Invalid interval. Using default: " + DEFAULT_INTERVAL_MINUTES + " minutes");
-                }
-            }
-
             robot = new Robot();
-
-            System.out.println("=== Keep MS Teams Active ===");
-            System.out.println("Activity interval: " + intervalMinutes + " minute(s)");
-            System.out.println("Program started at: " + new java.util.Date());
-            System.out.println("Press Ctrl+C to stop");
-            System.out.println("============================\n");
-
-            long intervalMillis = TimeUnit.MINUTES.toMillis(intervalMinutes);
-            int activityCount = 0;
-
-            while (true) {
-                activityCount++;
-                performActivity(activityCount);
-
-                System.out.println("Next activity in " + intervalMinutes + " minute(s)...\n");
-                Thread.sleep(intervalMillis);
-            }
-
         } catch (AWTException e) {
-            System.err.println("Error: Unable to create Robot instance");
-            System.err.println("Make sure you have the necessary permissions");
-            e.printStackTrace();
-        } catch (InterruptedException e) {
-            System.out.println("\nProgram interrupted. Exiting...");
-        }
-    }
-
-    /**
-     * Performs simulated user activity
-     */
-    private static void performActivity(int count) {
-        System.out.println("[" + new java.util.Date() + "] Activity #" + count);
-
-        // Randomly choose activity type
-        int activityType = random.nextInt(3);
-
-        switch (activityType) {
-            case 0:
-                moveMouseRandomly();
-                break;
-            case 1:
-                pressShiftKey();
-                break;
-            case 2:
-                moveMouseAndPressKey();
-                break;
-        }
-    }
-
-    private static void moveMouseRandomly() {
-        System.out.println("Action: Moving mouse randomly");
-
-        Point currentPos = MouseInfo.getPointerInfo().getLocation();
-        int startX = currentPos.x;
-        int startY = currentPos.y;
-
-        for (int i = 0; i < 4; i++) {
-            int offsetX = random.nextInt(100) - 50;
-            int offsetY = random.nextInt(100) - 50;
-
-            robot.mouseMove(startX + offsetX, startY + offsetY);
-            robot.delay(100);
+            System.err.println("Unable to initialize Robot (check display/permissions): " + e.getMessage());
+            return;
         }
 
-        robot.mouseMove(startX, startY);
-        System.out.println("Mouse movement completed");
-    }
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "activity-keeper-thread");
+            t.setDaemon(true); // won't prevent JVM shutdown
+            return t;
+        });
 
-    private static void pressShiftKey() {
-        System.out.println("Action: Pressing Shift key");
+        System.out.println("SystemActivityKeeper started. Nudging mouse every "
+                + INTERVAL_MINUTES + " minute(s). Press Ctrl+C to stop.");
 
-        robot.keyPress(KeyEvent.VK_SHIFT);
-        robot.delay(50);
-        robot.keyRelease(KeyEvent.VK_SHIFT);
+        Runnable nudgeTask = () -> {
+            try {
+                Point current = MouseInfo.getPointerInfo().getLocation();
+                int x = (int) current.getX();
+                int y = (int) current.getY();
 
-        System.out.println("Shift key pressed");
-    }
+                // Move slightly, then back — keeps cursor position effectively unchanged
+                robot.mouseMove(x + NUDGE_PIXELS, y);
+                robot.mouseMove(x, y);
 
-    private static void moveMouseAndPressKey() {
-        System.out.println("Action: Moving mouse + pressing key");
+                System.out.println("[" + LocalDateTime.now().format(TIME_FORMAT)
+                        + "] Activity nudge sent (cursor at " + x + "," + y + ")");
+            } catch (Exception e) {
+                System.err.println("Nudge failed: " + e.getMessage());
+            }
+        };
 
-        Point currentPos = MouseInfo.getPointerInfo().getLocation();
+        // Run once immediately, then repeat every INTERVAL_MINUTES
+        scheduler.scheduleAtFixedRate(nudgeTask, 0, INTERVAL_MINUTES, TimeUnit.MINUTES);
 
-        robot.mouseMove(currentPos.x + 10, currentPos.y + 10);
-        robot.delay(50);
-        robot.mouseMove(currentPos.x, currentPos.y);
+        // Keep the main thread alive since the scheduler thread is a daemon
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutting down SystemActivityKeeper.");
+            scheduler.shutdownNow();
+        }));
 
-        robot.keyPress(KeyEvent.VK_SCROLL_LOCK);
-        robot.delay(50);
-        robot.keyRelease(KeyEvent.VK_SCROLL_LOCK);
-        robot.delay(50);
-        robot.keyPress(KeyEvent.VK_SCROLL_LOCK);
-        robot.delay(50);
-        robot.keyRelease(KeyEvent.VK_SCROLL_LOCK);
-
-        System.out.println("Combined activity completed");
+        try {
+            Thread.currentThread().join(); // block forever until process is killed
+        } catch (InterruptedException ignored) {
+        }
     }
 }
