@@ -1,6 +1,7 @@
 import com.sun.jna.Native;
 import com.sun.jna.Library;
 import com.sun.jna.platform.win32.WinDef.HWND;
+import com.sun.jna.platform.win32.WinDef.RECT;
 import com.sun.jna.win32.W32APIOptions;
 
 import java.awt.AWTException;
@@ -13,42 +14,13 @@ import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-
-/**
- * KeepEdgeActive
- * --------------
- * Periodically simulates minimal, harmless user input (a tiny mouse nudge)
- * ONLY when Microsoft Edge is the foreground (focused) window, so that a
- * website session does not time out due to inactivity.
- *
- * Design notes:
- *  - Does NOT send page refresh / navigation keys by default, because a
- *    forced refresh can lose form state or trigger re-authentication on
- *    some banking/enterprise sites. Instead it moves the mouse pointer by a
- *    small random offset (and back to its original spot) each cycle, which
- *    resets client-side and server-side idle timers that rely on standard
- *    browser activity events (mousemove) without dragging, clicking, or
- *    otherwise interacting with page content.
- *  - Only acts when Edge is focused, so it won't steal input from whatever
- *    else you're working in.
- *  - Requires the JNA and jna-platform jars on the classpath.
- *
- * Build/run:
- *   javac -cp jna-5.14.0.jar;jna-platform-5.14.0.jar KeepEdgeActive.java
- *   java  -cp .;jna-5.14.0.jar;jna-platform-5.14.0.jar KeepEdgeActive
- *
- * Configure INTERVAL_SECONDS and WINDOW_TITLE_FILTER below as needed.
- */
 public class KeepEdgeActive {
 
     // How often to check/nudge. Keep below the site's idle-timeout window
     // (e.g., if the site times out at 5 minutes, use 120-180 seconds).
     private static final int INTERVAL_SECONDS = 120;
 
-    // Only nudge if the foreground window title contains this text.
-    // "Edge" appears in Edge's window title on most Windows builds; you can
-    // narrow this to your site's tab title (e.g., "Scotiabank") to be safer.
-    private static final String WINDOW_TITLE_FILTER = "Edge";
+    private static final String WINDOW_TITLE_FILTER = "YourSiteNameHere";
 
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final Random RANDOM = new Random();
@@ -60,6 +32,8 @@ public class KeepEdgeActive {
         HWND GetForegroundWindow();
 
         int GetWindowTextW(HWND hWnd, char[] lpString, int nMaxCount);
+
+        boolean GetWindowRect(HWND hWnd, RECT rect);
     }
 
     public static void main(String[] args) throws AWTException {
@@ -77,12 +51,14 @@ public class KeepEdgeActive {
 
         scheduler.scheduleAtFixedRate(() -> {
             try {
-                String activeTitle = getForegroundWindowTitle();
+                HWND hwnd = User32Ext.INSTANCE.GetForegroundWindow();
+                String activeTitle = getWindowTitle(hwnd);
+                log("Detected foreground window title: \"" + activeTitle + "\"");
                 if (activeTitle != null && activeTitle.toLowerCase().contains(WINDOW_TITLE_FILTER.toLowerCase())) {
-                    nudgeMouseRandom(robot);
-                    log("Edge active (\"" + activeTitle + "\") -> moved cursor randomly to keep session alive.");
+                    nudgeMouseWithinWindow(robot, hwnd);
+                    log("Site active (\"" + activeTitle + "\") -> moved cursor within the window to keep session alive.");
                 } else {
-                    log("Edge not focused (active: \"" + activeTitle + "\") -> skipped.");
+                    log("Site not focused (active: \"" + activeTitle + "\") -> skipped.");
                 }
             } catch (Exception e) {
                 log("Error during activity check: " + e.getMessage());
@@ -97,8 +73,7 @@ public class KeepEdgeActive {
         }
     }
 
-    private static String getForegroundWindowTitle() {
-        HWND hwnd = User32Ext.INSTANCE.GetForegroundWindow();
+    private static String getWindowTitle(HWND hwnd) {
         if (hwnd == null) {
             return null;
         }
@@ -107,26 +82,41 @@ public class KeepEdgeActive {
         return new String(buffer, 0, len);
     }
 
-    private static void nudgeMouseRandom(Robot robot) {
-        Point p = MouseInfo.getPointerInfo().getLocation();
-        int x = p.x;
-        int y = p.y;
+    private static void nudgeMouseWithinWindow(Robot robot, HWND hwnd) {
+        RECT rect = new RECT();
+        if (hwnd == null || !User32Ext.INSTANCE.GetWindowRect(hwnd, rect)) {
+            // Fall back to a small nudge at the current cursor position if
+            // we couldn't read the window bounds for some reason.
+            Point p = MouseInfo.getPointerInfo().getLocation();
+            robot.mouseMove(p.x + 1, p.y + 1);
+            robot.delay(50);
+            robot.mouseMove(p.x, p.y);
+            return;
+        }
 
-        // Pick a random offset in each direction, e.g. -15..15 px, skipping 0
-        // so it always actually moves.
-        int dx = randomOffset(15);
-        int dy = randomOffset(15);
+        // Inset from the raw window rect so we land inside the page content
+        // area rather than on the title bar, borders, or browser chrome
+        // (tabs/toolbar). Adjust these margins if your layout differs.
+        int marginLeft = 20;
+        int marginTop = 120;   // clears title bar + tab strip + toolbar
+        int marginRight = 20;
+        int marginBottom = 20;
 
-        robot.mouseMove(x + dx, y + dy);
-        robot.delay(80);
-        // Move back to the original spot so the cursor doesn't drift away
-        // over time.
+        int minX = rect.left + marginLeft;
+        int maxX = rect.right - marginRight;
+        int minY = rect.top + marginTop;
+        int maxY = rect.bottom - marginBottom;
+
+        if (maxX <= minX || maxY <= minY) {
+            // Window too small for the assumed margins; just skip this cycle
+            // rather than moving somewhere unintended.
+            return;
+        }
+
+        int x = minX + RANDOM.nextInt(maxX - minX);
+        int y = minY + RANDOM.nextInt(maxY - minY);
+
         robot.mouseMove(x, y);
-    }
-
-    private static int randomOffset(int maxAbs) {
-        int value = RANDOM.nextInt(maxAbs * 2 + 1) - maxAbs; // range: -maxAbs..maxAbs
-        return value == 0 ? 1 : value;
     }
 
     private static void log(String message) {
