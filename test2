@@ -1,60 +1,165 @@
-# /etc/httpd/conf.d/ssl.conf
+import com.sun.jna.Native;
+import com.sun.jna.Library;
+import com.sun.jna.platform.win32.WinDef.HWND;
+import com.sun.jna.platform.win32.WinDef.RECT;
+import com.sun.jna.win32.W32APIOptions;
 
-Listen 443 https
+import java.awt.AWTException;
+import java.awt.Robot;
+import java.awt.event.InputEvent;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
-# Shared session cache across worker processes (recommended, not strictly required)
-SSLSessionCache        shmcb:/run/httpd/sslcache(512000)
-SSLSessionCacheTimeout 300
+/**
+ * KeepEdgeActive
+ * --------------
+ * Every INTERVAL_SECONDS, if your target site's tab is the focused window,
+ * drags a vertical slider's handle from one end to the other (alternating
+ * up/down each cycle) so the site sees real drag activity and does not
+ * time out the session due to inactivity.
+ *
+ * Design notes:
+ *  - Only acts when your target site's tab is focused (matched by title, not
+ *    browser name), so it won't steal input from whatever else you're
+ *    working in.
+ *  - Drags in small incremental steps rather than jumping straight to the
+ *    target, since most slider UI components only register a position
+ *    change if they see intermediate mousemove events while the button is
+ *    held down.
+ *  - Requires the JNA and jna-platform jars on the classpath.
+ *
+ * Build/run:
+ *   javac -cp jna-5.14.0.jar;jna-platform-5.14.0.jar KeepEdgeActive.java
+ *   java  -cp .;jna-5.14.0.jar;jna-platform-5.14.0.jar KeepEdgeActive
+ *
+ * Configure INTERVAL_SECONDS, WINDOW_TITLE_FILTER, and the SLIDER_*_OFFSET
+ * constants below to match your site.
+ */
+public class KeepEdgeActive {
 
-##
-## VirtualHost for HTTPS
-##
-<VirtualHost *:443>
-    ServerName yourdomain.com
-    ServerAlias www.yourdomain.com
-    DocumentRoot /var/www/html
+    // How often to drag the slider. Keep below the site's idle-timeout window.
+    private static final int INTERVAL_SECONDS = 300; // 5 minutes
 
-    ErrorLog logs/ssl_error_log
-    TransferLog logs/ssl_access_log
-    LogLevel warn
+    // Position of the vertical slider's handle, as an offset from the
+    // window's top-left corner. You MUST set these to match where the
+    // slider actually sits on your page -- open the site, note the pixel
+    // position of the slider track's top and bottom (and its x-coordinate),
+    // then fill these in relative to the browser window's top-left corner.
+    private static final int SLIDER_X_OFFSET = 400;      // horizontal position of the slider
+    private static final int SLIDER_TOP_Y_OFFSET = 150;  // slider track's top (handle's "up" position)
+    private static final int SLIDER_BOTTOM_Y_OFFSET = 450; // slider track's bottom ("down" position)
 
-    # ---- SSL Engine ----
-    SSLEngine on
+    // Tracks which end the handle is currently at, so each cycle drags to
+    // the opposite end (up, then down, then up, ...).
+    private static boolean sliderAtTop = true;
 
-    # ---- Certificate: leaf cert + Issuing CA + Policy CA, in that order ----
-    SSLCertificateFile    /etc/httpd/ssl/fullchain.crt
-    SSLCertificateKeyFile /etc/httpd/ssl/server.key
+    // Only nudge if the foreground window title contains this text.
+    // Match on your specific site's page title (e.g. "Scotiabank") rather
+    // than the browser name, so this works in Chrome, Edge, or any browser,
+    // and only nudges when that exact site's tab is focused.
+    private static final String WINDOW_TITLE_FILTER = "YourSiteNameHere";
 
-    # ---- Protocol / Cipher hardening (PCI DSS 4.0 compliant) ----
-    SSLProtocol -all +TLSv1.2 +TLSv1.3
-    SSLCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305
-    SSLHonorCipherOrder on
+    private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-    # ---- HSTS ----
-    Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains"
+    // Minimal JNA binding for the two user32 calls we need.
+    public interface User32Ext extends Library {
+        User32Ext INSTANCE = Native.load("user32", User32Ext.class, W32APIOptions.DEFAULT_OPTIONS);
 
-    <Directory "/var/www/html">
-        Options -Indexes +FollowSymLinks
-        AllowOverride None
-        Require all granted
-    </Directory>
-</VirtualHost>
+        HWND GetForegroundWindow();
 
-##
-## Redirect HTTP -> HTTPS
-##
-<VirtualHost *:80>
-    ServerName yourdomain.com
-    ServerAlias www.yourdomain.com
-    Redirect permanent / https://yourdomain.com/
-</VirtualHost>
+        int GetWindowTextW(HWND hWnd, char[] lpString, int nMaxCount);
 
-## Build the fullchain and set permissions
-cat server.crt IssuingCA.crt PolicyCA.crt > /etc/httpd/ssl/fullchain.crt
-chmod 644 /etc/httpd/ssl/fullchain.crt
-chmod 600 /etc/httpd/ssl/server.key
-chown root:root /etc/httpd/ssl/*
+        boolean GetWindowRect(HWND hWnd, RECT rect);
+    }
 
-## Test and reload
-sudo apachectl configtest
-sudo systemctl restart httpd
+    public static void main(String[] args) throws AWTException {
+        Robot robot = new Robot();
+        robot.setAutoWaitForIdle(true);
+
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "keep-edge-active");
+            t.setDaemon(true);
+            return t;
+        });
+
+        log("Started. Checking every " + INTERVAL_SECONDS + "s for foreground window containing \""
+                + WINDOW_TITLE_FILTER + "\".");
+
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                HWND hwnd = User32Ext.INSTANCE.GetForegroundWindow();
+                String activeTitle = getWindowTitle(hwnd);
+                if (activeTitle != null && activeTitle.toLowerCase().contains(WINDOW_TITLE_FILTER.toLowerCase())) {
+                    boolean wasAtTop = sliderAtTop;
+                    dragVerticalSlider(robot, hwnd);
+                    log("Site active (\"" + activeTitle + "\") -> dragged slider "
+                            + (wasAtTop ? "down" : "up") + " to keep session alive.");
+                } else {
+                    log("Site not focused (active: \"" + activeTitle + "\") -> skipped.");
+                }
+            } catch (Exception e) {
+                log("Error during activity check: " + e.getMessage());
+            }
+        }, 0, INTERVAL_SECONDS, TimeUnit.SECONDS);
+
+        // Keep the JVM alive. Ctrl+C to stop.
+        try {
+            Thread.currentThread().join();
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static String getWindowTitle(HWND hwnd) {
+        if (hwnd == null) {
+            return null;
+        }
+        char[] buffer = new char[512];
+        int len = User32Ext.INSTANCE.GetWindowTextW(hwnd, buffer, buffer.length);
+        return new String(buffer, 0, len);
+    }
+
+    private static void dragVerticalSlider(Robot robot, HWND hwnd) {
+        RECT rect = new RECT();
+        if (hwnd == null || !User32Ext.INSTANCE.GetWindowRect(hwnd, rect)) {
+            log("Could not read window bounds -- skipping slider drag this cycle.");
+            return;
+        }
+
+        int sliderX = rect.left + SLIDER_X_OFFSET;
+        int topY = rect.top + SLIDER_TOP_Y_OFFSET;
+        int bottomY = rect.top + SLIDER_BOTTOM_Y_OFFSET;
+
+        int fromY = sliderAtTop ? topY : bottomY;
+        int toY = sliderAtTop ? bottomY : topY;
+        sliderAtTop = !sliderAtTop; // flip for next cycle
+
+        // Move to the handle's current position first.
+        robot.mouseMove(sliderX, fromY);
+        robot.delay(150);
+
+        // Press and hold, as if grabbing the slider handle.
+        robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+        robot.delay(150);
+
+        // Drag in small steps rather than jumping straight there -- most
+        // slider UI components only register position changes if they see
+        // intermediate mousemove events while the button is held.
+        int steps = 25;
+        for (int i = 1; i <= steps; i++) {
+            int y = fromY + (toY - fromY) * i / steps;
+            robot.mouseMove(sliderX, y);
+            robot.delay(20);
+        }
+
+        robot.delay(150);
+        robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+    }
+
+    private static void log(String message) {
+        System.out.println("[" + LocalDateTime.now().format(TS) + "] " + message);
+    }
+}
