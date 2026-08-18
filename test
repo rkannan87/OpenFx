@@ -1,417 +1,655 @@
+Given the size, here's every changed piece, organized by file. I'm providing complete replacement code for every method that changes, and noting clearly where unseen/unchanged code stays as-is (I haven't seen the full contents of these large classes — e.g. calculateAnetChars, buildFraudPart in FullfillerDefault — so I'm not fabricating those).
+
+Design recap (so the code below is self-consistent)
+Job gets a new field panKeyLocation, generated once per job, in ChunkGeneratorController.postChunks — before dispatching any chunk.
+That value is carried on every ChunkMessage via the existing encPanCsvPath field (no ChunkMessage schema change).
+Stage 3 (SaveTriggeredConsumerDataImpl) and Stage 4 (FullfillerDefault) both read cm.getEncPanCsvPath() as the shared keyLocation and use the "always unknown, mint fresh index" substitution path.
+Neither Stage 3 nor Stage 4 evicts PanSubstitutionService caches — they're shared across the whole job's lifetime.
+Stage 5 (ShipfileBuilderImpl) reads job.getPanKeyLocation() directly (no more disk-scan-then-cache-lookup), builds the final ciphertext map, writes .out.EncPan.csv, and evicts caches for that keyLocation — this is the only place eviction happens.
+1. Job entity — new field
+
+private String panKeyLocation;
+
+public String getPanKeyLocation() {
+    return panKeyLocation;
+}
+
+public void setPanKeyLocation(String panKeyLocation) {
+    this.panKeyLocation = panKeyLocation;
+}
+(Add the corresponding column to the entity's table/mapping per your ORM setup — I don't have visibility into whether this is annotation-based JPA or XML-mapped, so I can't give the exact column-mapping syntax.)
+
+2. PanSubstitutionService.java — one addition
+
+private static final int KEY_LOCATION_LENGTH = 24;
+
+/**
+ * Generate a brand-new random key-location. Used as the PanSubstitutionService
+ * cache key and Vault keyLocation for an entire job - generated once by
+ * ChunkGeneratorController.postChunks before any chunk is dispatched, then
+ * carried on every ChunkMessage so all chunks in the job share it.
+ */
+public static String generateKeyLocation() {
+    return RandomStringUtils.secure().nextAlphanumeric(KEY_LOCATION_LENGTH);
+}
+(Requires import org.apache.commons.lang3.RandomStringUtils; if not already present.)
+
+Everything else in PanSubstitutionService — getOrCreateSeqIndexForUnknownPan, buildPlainPanMapForOutput, buildOutputCiphertextMap, filterToIndicesPresentInOutput, evict, storeOutputAccountFieldInfo/getOutputAccountFieldInfo — is unchanged; they already work correctly keyed by any string, including a generated keyLocation.
+
+3. PanRestorationHelper.java — complete file
+
 package ca.tuc.triggers.processor.pan;
 
-import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
-
-import org.apache.commons.lang3.RandomStringUtils;
-import org.apache.hc.client5.http.classic.methods.HttpGet;
-import org.apache.hc.client5.http.classic.methods.HttpPost;
-import org.apache.hc.client5.http.config.RequestConfig;
-import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
-import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
-import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
-import org.apache.hc.core5.http.ContentType;
-import org.apache.hc.core5.http.io.entity.EntityUtils;
-import org.apache.hc.core5.http.io.entity.StringEntity;
-import org.apache.hc.core5.util.Timeout;
-
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-
-import org.jasypt.encryption.pbe.PooledPBEStringEncryptor;
-import org.jasypt.encryption.pbe.config.SimpleStringPBEConfig;
-
+import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * Vault-backed PAN decryption service using AppRole authentication.
- * When enabled=true:
- *   1. Authenticates to Vault via AppRole (roleId + secretId)
- *   2. Fetches AES key from KV v2 at {kvMount}/{keyLocation}
- *   3. Decrypts each ciphertext using Jasypt StandardPBEStringEncryptor
- * When enabled=false:
- *   decryptAll() returns the input map unchanged (passthrough).
- * Vault properties are read from server-specific.properties via Spring XML.
+ * Utility for substituting realPan -> INDEX in DTOs and consumer row strings.
+ * All substitution is keyed by a job-wide keyLocation (generated once per job
+ * by ChunkGeneratorController.postChunks). Since keyLocation is always fresh
+ * for a job, every PAN encountered is "unknown" to PanSubstitutionService's
+ * caches the first time it's seen within that job, and mints a new sequential
+ * INDEX starting at 1 - subsequent occurrences of the same PAN within the
+ * same job reuse that INDEX via PanSubstitutionService's internal dedup.
  */
 @Slf4j
-public class VaultPanDecryptService implements PanDecryptService {
+public final class PanRestorationHelper {
 
-    private boolean enabled;
-    private String scheme;
-    private String host;
-    private int port = 8200;
-    private String appRolePath;
-    private String roleId;
-    private String secretId;
-    private String kvMount;
-
-    private static final String X_VAULT_TOKEN = "X-Vault-Token";
-    private static final int TIMEOUT_MS = 10000;
-    private static final int GENERATED_KEY_LENGTH = 32;
-
-    /** Cached Vault client token from AppRole login */
-    private volatile String clientToken;
-
-    private final ObjectMapper objectMapper = new ObjectMapper();
-
-    private static CloseableHttpClient buildHttpClient() {
-        RequestConfig requestConfig = RequestConfig.custom()
-                .setConnectTimeout(Timeout.ofMilliseconds(TIMEOUT_MS))
-                .setResponseTimeout(Timeout.ofMilliseconds(TIMEOUT_MS))
-                .build();
-        return HttpClientBuilder.create()
-                .setDefaultRequestConfig(requestConfig)
-                .build();
-    }
-
-    private PooledPBEStringEncryptor getEncryptor(String encryptionKey) {
-        PooledPBEStringEncryptor encryptor = new PooledPBEStringEncryptor();
-        SimpleStringPBEConfig config = new SimpleStringPBEConfig();
-        config.setPassword(encryptionKey);
-        config.setAlgorithm("PBEWITHHMACSHA512ANDAES_256");
-        config.setIvGeneratorClassName("org.jasypt.iv.RandomIvGenerator");
-        config.setPoolSize("1");
-        encryptor.setConfig(config);
-        return encryptor;
+    private PanRestorationHelper() {
     }
 
     /**
-     * Encrypt all plain PAN values using the AES key at the given Vault key location.
-     * If no key exists yet at that location, a new one is generated and stored,
-     * since this is the first-write path for a chunk.
+     * Substitute the account number in a serialized |AC| row with a job-wide
+     * consistent sequential INDEX, without mutating any DTO. acctNum is 3
+     * tokens after the "AC" token (AC|subId|ref|acctNum).
      *
-     * @param keyLocation     Vault secret path suffix (from encPan.csv header)
-     * @param indexToPlainPan map of new sequential index to plain PAN
-     * @return map of new sequential index to fresh ciphertext (not yet ENC-wrapped)
+     * @param row         the raw row string
+     * @param keyLocation job-wide key-location (from cm.getEncPanCsvPath())
+     * @param fieldLength the customer's account field length for zero-padding
+     * @return the row with acctNum replaced by its sequential INDEX
      */
-    @Override
-    public Map<String, String> encryptAll(String keyLocation, Map<String, String> indexToPlainPan) {
-
-        if (!enabled) {
-            return indexToPlainPan;
+    public static String substituteAcctNumInRow(String row, String keyLocation, int fieldLength) {
+        if (row == null || keyLocation == null || !row.contains("|AC|")) {
+            return row;
         }
 
-        String aesKey;
-        try {
-            aesKey = fetchDecryptionKey(keyLocation, true);
-        } catch (VaultException e) {
-            log.error("failed to fetch AES key from vault for output CSV encryption keyLocation=[{}]", keyLocation, e);
-            return new HashMap<>();
-        }
+        String[] cols = row.split("\\|", -1);
 
-        PooledPBEStringEncryptor encryptor = getEncryptor(aesKey);
-        Map<String, String> result = new HashMap<>();
-        for (Map.Entry<String, String> entry : indexToPlainPan.entrySet()) {
-            try {
-                String ciphertext = encryptor.encrypt(entry.getValue());
-                result.put(entry.getKey(), ciphertext);
-            } catch (Exception e) {
-                log.error("failed to encrypt PAN for index [{}]", entry.getKey(), e);
-            }
+        int acIdx = -1;
+        for (int i = 0; i < cols.length; i++) {
+            if ("AC".equals(cols[i].trim())) { acIdx = i; break; }
         }
+        if (acIdx == -1) return row;
 
-        log.info("encrypted [{}] PAN values for output CSV using vault key location=[{}]", result.size(), keyLocation);
-        return result;
+        int acctNumIdx = acIdx + 3;
+        if (acctNumIdx >= cols.length) return row;
+
+        String acctNum = cols[acctNumIdx].trim();
+        if (acctNum.isEmpty()) return row;
+
+        String seqIndex = PanSubstitutionService.getOrCreateSeqIndexForUnknownPan(keyLocation, acctNum, fieldLength);
+        if (seqIndex == null) return row;
+
+        int padLen = cols[acctNumIdx].length();
+        cols[acctNumIdx] = String.format("%-" + padLen + "s", seqIndex);
+
+        log.debug("txt: realPan -> seqIndex [{}] col [{}]", seqIndex, acctNumIdx);
+        return String.join("|", cols);
     }
 
     /**
-     * Decrypt all ciphertext values using the AES key located at the given
-     * Vault key location.
+     * Substitute every |AC| line within a multi-line block (TriggeredResultWrapper
+     * output / |TD| notification rows). Preserves line separators.
      *
-     * @param keyLocation     Vault secret path suffix (from encPan.csv header)
-     * @param indexToEncValue map of index to raw ciphertext (already ENC-unwrapped)
-     * @return map of index to plain PAN
+     * @param block       multi-line block, possibly containing |AC| lines
+     * @param keyLocation job-wide key-location (from cm.getEncPanCsvPath())
+     * @param fieldLength the customer's account field length for zero-padding
+     * @return the block with every |AC| line's acctNum replaced by its sequential INDEX
      */
-    @Override
-    public Map<String, String> decryptAll(String keyLocation, Map<String, String> indexToEncValue) {
-
-        if (!enabled) {
-            return indexToEncValue;
+    public static String substituteAcLinesInBlock(String block, String keyLocation, int fieldLength) {
+        if (block == null || !block.contains("|AC|")) {
+            return block;
         }
 
-        String aesKey;
-        try {
-            aesKey = fetchDecryptionKey(keyLocation, false);
-        } catch (VaultException e) {
-            log.warn("failed to fetch AES key from vault at keyLocation=[{}], returning empty map", keyLocation, e);
-            return new HashMap<>();
-        }
+        StringBuilder out = new StringBuilder(block.length() + 16);
+        int start = 0;
+        int len = block.length();
 
-        PooledPBEStringEncryptor encryptor = getEncryptor(aesKey);
-        Map<String, String> result = new HashMap<>();
-        for (Map.Entry<String, String> entry : indexToEncValue.entrySet()) {
-            try {
-                String plainPan = encryptor.decrypt(entry.getValue());
-                result.put(entry.getKey(), plainPan);
-            } catch (Exception e) {
-                log.warn("failed to decrypt PAN for index [{}]", entry.getKey(), e);
+        while (start < len) {
+            int nl = block.indexOf('\n', start);
+            int contentEnd = (nl < 0) ? len : nl;
+            boolean hasCr = (contentEnd > start && block.charAt(contentEnd - 1) == '\r');
+            if (hasCr) contentEnd--;
+
+            String line = block.substring(start, contentEnd);
+            if (line.contains("|AC|")) {
+                line = substituteAcctNumInRow(line, keyLocation, fieldLength);
             }
-        }
 
-        log.info("decrypted [{}] PAN values using vault key location=[{}]", result.size(), keyLocation);
-        return result;
+            out.append(line);
+            if (hasCr) out.append('\r');
+            if (nl >= 0) out.append('\n');
+
+            start = (nl < 0) ? len : nl + 1;
+        }
+        return out.toString();
     }
 
     /**
-     * Fetch the decryption key from Vault KV v2 store using Apache HttpClient5.
-     * When allowGenerate is true and no key exists at keyLocation (a genuine
-     * 404), generates a new random key and persists it to Vault before
-     * returning it — used by encryptAll for first-time writes. When
-     * allowGenerate is false, a missing key is treated as an error — used by
-     * decryptAll to avoid silently fabricating a key for ciphertext that may
-     * already exist under that path. Any Vault failure other than a 404
-     * (auth errors, 5xx, network failures) always throws, regardless of
-     * allowGenerate, so transient outages never trigger key generation.
+     * Substitute the account field in a cinquiry consumer row string, realPan
+     * -> sequential INDEX.
      *
-     * @param keyLocation   Vault secret path suffix (from encPan.csv header)
-     * @param allowGenerate whether to generate+store a new key if none is found
-     * @return the decryption key value — existing or freshly generated
-     * @throws VaultException if scheme is not HTTPS, keyLocation is missing,
-     *                        the HTTP call fails, or the key is absent from
-     *                        the Vault response and allowGenerate is false
+     * @param consumer      the raw consumer row string from cinquiry
+     * @param accountOffset the input offset of the account field
+     * @param accountLength the length of the account field
+     * @param keyLocation   job-wide key-location (from cm.getEncPanCsvPath())
+     * @return the consumer string with the account field set to its sequential INDEX
      */
-    private String fetchDecryptionKey(String keyLocation, boolean allowGenerate) {
-        if (!"https".equalsIgnoreCase(scheme)) {
-            throw VaultException.keyFetchError(
-                "Vault communication requires HTTPS. Configured scheme '" + scheme + "' is not permitted.", null);
+    public static String substituteConsumerRow(String consumer, int accountOffset, int accountLength, String keyLocation) {
+        if (consumer == null || keyLocation == null) {
+            return consumer;
         }
-        if (keyLocation == null || keyLocation.isBlank()) {
-            throw VaultException.keyFetchError(
-                "key-location is missing from the EncPan CSV header - cannot determine Vault secret path.", null);
+        if (consumer.length() < accountOffset + accountLength) {
+            log.warn("consumer row too short for account field at offset={} length={} consumer.length={}",
+                accountOffset, accountLength, consumer.length());
+            return consumer;
         }
 
-        try {
-            if (clientToken == null) {
-                clientToken = loginAppRole();
-            }
-
-            String secretUrl = String.format("%s://%s:%d/v1/%s/%s", scheme, host, port, kvMount, keyLocation);
-
-            VaultReadResult result = readKeyFromVault(secretUrl, clientToken);
-            if (result.tokenExpired()) {
-                // Token may have expired, re-authenticate once and retry
-                log.info("vault token may have expired, re-authenticating");
-                clientToken = loginAppRole();
-                result = readKeyFromVault(secretUrl, clientToken);
-            }
-
-            if (result.tokenExpired()) {
-                throw VaultException.keyFetchError("vault authentication failed even after re-login", null);
-            }
-
-            if (result.found()) {
-                log.debug("Decryption key fetched successfully from Vault.");
-                return result.key();
-            }
-
-            // result is a genuine 404 - key does not exist at this location
-            if (!allowGenerate) {
-                throw VaultException.keyMissing();
-            }
-            log.warn("no key found at keyLocation=[{}], generating a new key", keyLocation);
-            String newKey = RandomStringUtils.secure().nextAlphanumeric(GENERATED_KEY_LENGTH);
-            writeKeyToVault(secretUrl, clientToken, newKey);
-            log.debug("generated and stored new decryption key in Vault.");
-            return newKey;
-
-        } catch (VaultException e) {
-            throw e;
-        } catch (Exception e) {
-            throw VaultException.keyFetchError(e.getMessage(), e);
+        String realPan = consumer.substring(accountOffset, accountOffset + accountLength).trim();
+        if (realPan.isEmpty()) {
+            return consumer;
         }
-    }
 
-    /** Outcome of a Vault KV read: distinguishes "not found" from "call failed" from "success". */
-    private record VaultReadResult(boolean found, boolean tokenExpired, String key) {
-        static VaultReadResult found(String key) { return new VaultReadResult(true, false, key); }
-        static VaultReadResult notFound() { return new VaultReadResult(false, false, null); }
-        static VaultReadResult tokenExpired() { return new VaultReadResult(false, true, null); }
+        String seqIndex = PanSubstitutionService.getOrCreateSeqIndexForUnknownPan(keyLocation, realPan, accountLength);
+        if (seqIndex == null) {
+            return consumer;
+        }
+
+        char[] padded = new char[accountLength];
+        java.util.Arrays.fill(padded, ' ');
+        int copyLen = Math.min(seqIndex.length(), accountLength);
+        seqIndex.getChars(0, copyLen, padded, 0);
+
+        StringBuilder sb = new StringBuilder(consumer);
+        sb.replace(accountOffset, accountOffset + accountLength, new String(padded));
+
+        log.debug("substituted consumer row account field to sequential INDEX [{}]", seqIndex);
+        return sb.toString();
     }
 
     /**
-     * Issue the Vault KV v2 GET request and extract the "key" field from the
-     * response body. A 404 is treated as a genuine "not found" (distinct from
-     * other failures) so callers can safely decide whether to generate a new
-     * key. A 403 is treated as a possibly-expired token so the caller can
-     * retry once after re-authenticating. Any other non-2xx status, or a
-     * malformed/absent response body, is a real failure and throws.
+     * Substitute IndicBaseDto.accountNumber from realPan -> sequential INDEX
+     * for a flat list of DTOs (used in Stage 4 FullfillerDefault).
+     *
+     * @param dtos        list of IndicBaseDto
+     * @param keyLocation job-wide key-location (from cm.getEncPanCsvPath())
+     * @param fieldLength the customer's account field length for zero-padding
      */
-    private VaultReadResult readKeyFromVault(String secretUrl, String token) throws Exception {
-        try (CloseableHttpClient httpClient = buildHttpClient()) {
-            HttpGet getRequest = new HttpGet(secretUrl);
-            getRequest.setHeader(X_VAULT_TOKEN, token);
+    public static void substituteIndicDtoList(List<IndicBaseDto> dtos, String keyLocation, int fieldLength) {
+        if (dtos == null || keyLocation == null) {
+            return;
+        }
+        for (IndicBaseDto dto : dtos) {
+            if (dto instanceof IndicAccountDto) {
+                IndicAccountDto acct = (IndicAccountDto) dto;
+                String pan = acct.getAcctNum();
+                if (pan == null || pan.trim().isEmpty()) continue;
 
-            try (CloseableHttpResponse response = httpClient.execute(getRequest)) {
-                int status = response.getCode();
-
-                if (status == 404) {
-                    log.debug("no key found in vault at [{}] (404)", secretUrl);
-                    return VaultReadResult.notFound();
+                String seqIndex = PanSubstitutionService.getOrCreateSeqIndexForUnknownPan(keyLocation, pan.trim(), fieldLength);
+                if (seqIndex != null) {
+                    acct.setAcctNum(seqIndex);
                 }
-                if (status == 403) {
-                    log.debug("vault returned 403 for [{}], token may be expired", secretUrl);
-                    return VaultReadResult.tokenExpired();
-                }
-
-                String body = response.getEntity() != null
-                        ? EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8)
-                        : null;
-
-                if (status < 200 || status >= 300 || body == null) {
-                    log.error("vault HTTP error: status={}", status);
-                    throw VaultException.keyFetchError("vault read failed with status=" + status, null);
-                }
-
-                JsonNode root = objectMapper.readTree(body);
-                JsonNode keyNode = root.path("data").path("data").path("panCryptoKey");
-
-                if (keyNode.isMissingNode() || keyNode.isNull() || keyNode.asText("").isBlank()) {
-                    throw VaultException.keyFetchFailed(String.valueOf(status));
-                }
-                return VaultReadResult.found(keyNode.asText());
             }
         }
-    }
-
-    /**
-     * Write a newly generated PAN crypto key to Vault KV v2 at {kvMount}/{keyLocation}.
-     * Used only when fetchDecryptionKey finds no existing key at that path and
-     * allowGenerate is true.
-     */
-    private void writeKeyToVault(String secretUrl, String token, String key) throws Exception {
-        ObjectNode innerData = objectMapper.createObjectNode();
-        innerData.put("panCryptoKey", key);
-
-        ObjectNode requestBodyNode = objectMapper.createObjectNode();
-        requestBodyNode.set("data", innerData);
-
-        String jsonBody = objectMapper.writeValueAsString(requestBodyNode);
-
-        try (CloseableHttpClient httpClient = buildHttpClient()) {
-            HttpPost putRequest = new HttpPost(secretUrl);
-            putRequest.setHeader(X_VAULT_TOKEN, token);
-            putRequest.setEntity(new StringEntity(jsonBody, ContentType.APPLICATION_JSON));
-
-            try (CloseableHttpResponse response = httpClient.execute(putRequest)) {
-                int status = response.getCode();
-                if (status < 200 || status >= 300) {
-                    log.error("failed to write generated key to vault, status={}", status);
-                    throw VaultException.keyFetchError("vault write failed with status=" + status, null);
-                }
-                log.info("wrote newly generated PAN crypto key to vault");
-            }
-        }
-    }
-
-    /**
-     * Authenticate to Vault using AppRole and return the client token.
-     */
-    private String loginAppRole() throws Exception {
-        String loginUrl = buildBaseUrl() + "/v1/auth/" + appRolePath + "/login";
-
-        ObjectNode requestBodyNode = objectMapper.createObjectNode();
-        requestBodyNode.put("role_id", roleId);
-        requestBodyNode.put("secret_id", secretId);
-        String requestBody = objectMapper.writeValueAsString(requestBodyNode);
-
-        log.info("vault AppRole login at [{}]", loginUrl);
-
-        try (CloseableHttpClient httpClient = buildHttpClient()) {
-            HttpPost postRequest = new HttpPost(loginUrl);
-            postRequest.setEntity(new StringEntity(requestBody, ContentType.APPLICATION_JSON));
-
-            try (CloseableHttpResponse response = httpClient.execute(postRequest)) {
-                int status = response.getCode();
-                String body = response.getEntity() != null
-                        ? EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8)
-                        : null;
-
-                if (status < 200 || status >= 300 || body == null) {
-                    throw new IllegalStateException("vault AppRole login failed, HTTP status=" + status);
-                }
-
-                JsonNode root = objectMapper.readTree(body);
-                JsonNode tokenNode = root.path("auth").path("client_token");
-
-                if (tokenNode.isMissingNode() || tokenNode.isNull() || tokenNode.asText("").isBlank()) {
-                    throw new IllegalStateException("vault AppRole login failed, no client_token in response");
-                }
-
-                log.info("vault AppRole login successful");
-                return tokenNode.asText();
-            }
-        }
-    }
-
-    private String buildBaseUrl() {
-        return scheme + "://" + host + ":" + port;
-    }
-
-    // Spring property setters
-
-    public boolean isEnabled() {
-        return enabled;
-    }
-
-    public void setEnabled(boolean enabled) {
-        this.enabled = enabled;
-    }
-
-    public String getScheme() {
-        return scheme;
-    }
-
-    public void setScheme(String scheme) {
-        this.scheme = scheme;
-    }
-
-    public String getHost() {
-        return host;
-    }
-
-    public void setHost(String host) {
-        this.host = host;
-    }
-
-    public int getPort() {
-        return port;
-    }
-
-    public void setPort(int port) {
-        this.port = port;
-    }
-
-    public String getAppRolePath() {
-        return appRolePath;
-    }
-
-    public void setAppRolePath(String appRolePath) {
-        this.appRolePath = appRolePath;
-    }
-
-    public String getRoleId() {
-        return roleId;
-    }
-
-    public void setRoleId(String roleId) {
-        this.roleId = roleId;
-    }
-
-    public String getSecretId() {
-        return secretId;
-    }
-
-    public void setSecretId(String secretId) {
-        this.secretId = secretId;
-    }
-
-    public String getKvMount() {
-        return kvMount;
-    }
-
-    public void setKvMount(String kvMount) {
-        this.kvMount = kvMount;
     }
 }
+(Imports needed: ca.tuc.commons.dto.schema.indic.IndicBaseDto, ca.tuc.commons.dto.schema.indic.IndicAccountDto — matching what FullfillerDefault already references via ListDtoHelper.getByType(dtoSegments, "ca.tuc.commons.dto.schema.indic.IndicBaseDto").)
+
+resolveSeqIndexToRealPan, restoreConsumerRow, restoreIndicDtoList are removed — nothing in the redesigned flow loads a reverseMap from an existing file anymore, since keyLocation is always freshly generated per job rather than resolved from a prior search-phase CSV.
+
+4. ChunkGeneratorController.java — postChunks complete replacement
+java
+private void postChunks(Job job, Customer cust, EntityManager em) throws JMSException, NamingException {
+
+    List<Chunk> chunks = em.createNamedQuery("chunk.selectByJobId").setParameter(1, job.getId()).getResultList();
+
+    int numPosted = 0;
+    int chunkMessageType;
+
+    if (JobConstants.JOBTYPE_REGULAR.equalsIgnoreCase(job.getJobType())) {
+        chunkMessageType = BaseMessage.TYPE_DAILY;
+    } else if (JobConstants.JOBTYPE_FIRSTTIME.equalsIgnoreCase(job.getJobType())) {
+        chunkMessageType = BaseMessage.TYPE_FIRSTTIME;
+    } else if (JobConstants.JOBTYPE_ATTPLUS.equalsIgnoreCase(job.getJobType())) {
+        chunkMessageType = BaseMessage.TYPE_ATTPLUS;
+    } else {
+        chunkMessageType = BaseMessage.TYPE_DAILY;
+    }
+
+    // Generate ONE fresh Vault key-location for this entire job, before
+    // dispatching any chunk, so every chunk shares the identical value.
+    // Persisted on Job for Stage 5 (ShipfileBuilderImpl) to read directly,
+    // and carried on every ChunkMessage (via encPanCsvPath) for Stage 3/4.
+    PanDecryptService decryptService = PanDecryptServiceHolder.getInstance();
+    boolean vaultEnabled = (decryptService != null) && decryptService.isEnabled();
+    String panKeyLocation = vaultEnabled ? PanSubstitutionService.generateKeyLocation() : null;
+    if (panKeyLocation != null) {
+        job.setPanKeyLocation(panKeyLocation);
+    }
+
+    for (Chunk chunk : chunks) {
+
+        if ((chunk.getStartIdFid() == 0) && (chunk.getEndIdFid() == 0)) {
+            continue;
+        }
+
+        ChunkMessage msg = new ChunkMessage();
+
+        msg.setCompany(cust.getCustCode().toLowerCase());
+        msg.setCompanyId((int) job.getCustid());
+        msg.setJobId(job.getId());
+        msg.setChunkId(chunk.getId());
+        msg.setType(chunkMessageType);
+        msg.setEncPanCsvPath(panKeyLocation);
+        poster.postMessage(msg, job.getPriority());
+
+        numPosted++;
+    }
+
+    job.setChunks(numPosted);
+    em.persist(job);
+
+    log.info("posted {} chunks for customer:{} job:{} with job priority of:{}",
+        numPosted, job.getCustid(), job.getId(), job.getPriority());
+}
+resolveEncPanCsvPathFromDisk and getCSVPath become unused by this method — leave them in place unless you've confirmed nothing else calls them (I only saw them referenced from this one call site).
+
+5. SaveTriggeredConsumerDataImpl.java — complete saveConsumerData + helper
+java
+public void saveConsumerData(ChunkMessage cm,
+                              Map<Integer, List<FiredTriggerResult>> firedTriggerMap,
+                              Map<Integer, List<IndicBaseDto>> fidMap) throws TucException {
+
+    Object fileHandle = null;
+    String lineSeparator = System.lineSeparator();
+
+    AccountFieldLayout accountFieldLayout = AccountFieldLayout.getAccountFieldLayout(cm.getCompany());
+    int fieldLengthRp3 = accountFieldLayout.getLength();
+    PanDecryptService decryptService = PanDecryptServiceHolder.getInstance();
+    boolean vaultEnabled = (decryptService != null) && decryptService.isEnabled();
+
+    // Job-wide key-location, generated once by ChunkGeneratorController.postChunks
+    // and carried on every ChunkMessage for this job.
+    String keyLocation = vaultEnabled ? cm.getEncPanCsvPath() : null;
+
+    String txtPath = dirHelper.getAbsoluteFullfillName(cm);
+
+    try {
+        if (firedTriggerMap == null) {
+            log.info("no triggers fired for chunk [{}]", cm.getChunkId());
+            return;
+        }
+
+        fileHandle = fileio.openOutput(txtPath);
+
+        for (Integer cfid : firedTriggerMap.keySet()) {
+            List<IndicBaseDto> dtos = fidMap.get(cfid);
+            List<FiredTriggerResult> results = firedTriggerMap.get(cfid);
+
+            StringBuilder stuff = new StringBuilder();
+            String scfid = cfid.toString();
+            stuff.append(scfid).append("||A0").append(lineSeparator);
+
+            // Block A: TD notification rows (may contain |AC|)
+            TriggeredResultWrapper trw = new TriggeredResultWrapper();
+            for (FiredTriggerResult result : results) {
+                String block = trw.toString(scfid, result);
+                if (keyLocation != null && block.contains("|AC|")) {
+                    block = PanRestorationHelper.substituteAcLinesInBlock(block, keyLocation, fieldLengthRp3);
+                }
+                stuff.append(block);
+            }
+
+            // Block B: consumer DTO rows
+            for (IndicBaseDto dto : dtos) {
+                String line = scfid + "|" + dto.toString();
+                if (keyLocation != null) {
+                    line = PanRestorationHelper.substituteAcctNumInRow(line, keyLocation, fieldLengthRp3);
+                }
+                stuff.append(line).append(lineSeparator);
+            }
+
+            stuff.append(scfid).append("||ZZ").append(lineSeparator);
+            fileio.writePerson(fileHandle, stuff.toString());
+        }
+
+    } catch (Exception e) {
+        log.error(e.getMessage(), e);
+        throw new TucException("failed writing fulfill file for chunk [" + cm.getChunkId() + "]", e);
+    } finally {
+        if (fileHandle != null) {
+            try { fileio.close(fileHandle); }
+            catch (Exception ce) { log.error("error closing fulfill temp file", ce); }
+        }
+    }
+
+    if (keyLocation != null) {
+        try {
+            writeIntermediateEncPanCsv(txtPath, keyLocation, accountFieldLayout, decryptService, cm);
+        } catch (Exception e) {
+            log.error("intermediate EncPan CSV failed for chunk [{}], continuing without it - " +
+                "Stage 5 cold-cache recovery will handle", cm.getChunkId(), e);
+        }
+        // NOTE: no eviction here - PanSubstitutionService caches for keyLocation
+        // are shared with Stage 4 (FullfillerDefault) and finalized/evicted only
+        // by Stage 5 (ShipfileBuilderImpl) after the job's .out.EncPan.csv is written.
+    }
+}
+
+/**
+ * Write this chunk's intermediate .txt.EncPan.csv companion file, so that if
+ * the job crashes before Stage 5, ShipfileBuilderImpl.recoverFromIntermediateCsvs
+ * can rebuild the merged ciphertext map (and recover keyLocation) from disk.
+ */
+private void writeIntermediateEncPanCsv(String txtPath, String keyLocation, AccountFieldLayout outputLayout,
+                                         PanDecryptService decryptService, ChunkMessage cm) throws TucException {
+    Map<String, String> plainPanMap = PanSubstitutionService.buildPlainPanMapForOutput(keyLocation);
+    if (plainPanMap.isEmpty()) {
+        log.debug("no PAN entries for chunk [{}], skipping .txt.EncPan.csv", cm.getChunkId());
+        return;
+    }
+
+    Map<String, String> ciphertextMap = PanSubstitutionService.buildOutputCiphertextMap(
+        keyLocation, plainPanMap, keyLocation, decryptService);
+
+    String csvPath = txtPath + ".EncPan.csv";
+    String csvTmp = csvPath + ".tmp";
+    EncPanCsvWriter.write(csvTmp, keyLocation, ciphertextMap, outputLayout);
+    promote(csvTmp, csvPath); // throws TucException on failure — propagates to the one catch above
+}
+promote(String, String) — unchanged from your existing implementation (atomic temp-file rename).
+
+6. FullfillerDefault.java — the two changed blocks in fullfill(...)
+Block 1 — replace the old reverseMap/loadReverseMap setup (originally lines ~127–137):
+
+java
+String consumerRow = cinquiry.getConsumer();
+PanDecryptService decryptService = PanDecryptServiceHolder.getInstance();
+boolean vaultEnabled = (decryptService != null) && decryptService.isEnabled();
+
+// Job-wide key-location, generated once by ChunkGeneratorController.postChunks
+// and carried on every ChunkMessage for this job. Reused from Stage 3 so PAN
+// indices assigned there are recognized as "already known" here (dedup), and
+// any new PAN encountered here continues the same job-wide counter.
+String keyLocation = vaultEnabled ? cm.getEncPanCsvPath() : null;
+
+if (keyLocation != null) {
+    AccountFieldLayout inputLayout = AccountFieldLayout.getAccountFieldLayout(cm.getCompany());
+    consumerRow = PanRestorationHelper.substituteConsumerRow(
+        consumerRow, inputLayout.getOffset(), inputLayout.getLength(), keyLocation);
+    log.debug("substituted consumer row account at offset [{}] len [{}]",
+        inputLayout.getOffset(), inputLayout.getLength());
+
+    if (moveInputList != null && PanSubstitutionService.getOutputAccountFieldInfo(keyLocation) == null) {
+        AccountFieldLayout outputLayout = AccountFieldLayout.getOutputAccountFieldLayout(cm.getCompany(), moveInputList);
+        if (outputLayout != null) {
+            PanSubstitutionService.storeOutputAccountFieldInfo(keyLocation, outputLayout.getOffset(), outputLayout.getLength());
+            log.debug("stored output account field info offset=[{}] len=[{}] for [{}]",
+                outputLayout.getOffset(), outputLayout.getLength(), keyLocation);
+        }
+    }
+}
+(This inlines the old private restoreConsumerRowAccount helper directly — since it's now only a few lines and doesn't need reverseMap/csvPath params, keeping it as a one-line-shorter private method is optional; inlined here for clarity. If you'd rather keep it as a named method, wrap the above in private String substituteConsumerRowAccount(String consumerRow, String keyLocation, String company).)
+
+Block 2 — replace the second restoration block (originally lines ~162–172):
+
+java
+// Substitute IndicBaseDto.accountNumber from realPan -> sequential INDEX
+// AFTER ScoreService calls (which use realPan)
+// BEFORE final output assembly
+if (keyLocation != null) {
+    int fieldLengthRp3 = AccountFieldLayout.getAccountFieldLayout(cm.getCompany()).getLength();
+    List<IndicBaseDto> indicDtos = ListDtoHelper.getByType(dtoSegments, "ca.tuc.commons.dto.schema.indic.IndicBaseDto");
+    PanRestorationHelper.substituteIndicDtoList(indicDtos, keyLocation, fieldLengthRp3);
+    log.debug("substituted IndicBaseDto accountNumbers to sequential INDEX for output");
+}
+Everything else in fullfill(...) — calculateAnetChars, buildFromInputPart, buildFromNotificationPart, buildFromTriggersPart, buildFraudPart, buildAnetPart, buildAnetSegment, finalizeReport/genericEndPart/saveReporting, the catch blocks — is unchanged; I haven't seen those bodies and am not altering them.
+
+restoreConsumerRowAccount as a standalone private method is removed (inlined above) — if other call sites in this class use it, keep it as a named method instead with the signature (String consumerRow, String keyLocation, String company).
+
+7. ShipfileBuilderImpl.java — three changed methods
+build(...) — add job access to the PAN-substitution block (originally lines ~81–84 onward):
+
+java
+// Generate companion .out.EncPan.csv if PAN substitution was used.
+PanDecryptService decryptService = PanDecryptServiceHolder.getInstance();
+boolean vaultEnabled = (decryptService != null) && decryptService.isEnabled();
+if (shipped && vaultEnabled) {
+    generateEncPanCsv(cust.getCustCode(), outFileName, job);
+}
+return true;
+generateEncPanCsv — complete replacement, now takes Job and reads job.getPanKeyLocation() directly instead of resolving via disk + PanSubstitutionService.getKeyLocation(csvPath):
+
+java
+/**
+ * Generate a companion .out.EncPan.csv file if PAN substitution was used.
+ * Reads the job-wide keyLocation directly off the Job entity (set once by
+ * ChunkGeneratorController.postChunks) rather than resolving it from a
+ * search-phase CSV on disk. Falls back to intermediate-CSV recovery if the
+ * job's keyLocation is unset (older jobs) or the in-memory cache is cold
+ * (e.g. after a JVM restart mid-job).
+ *
+ * @param custCode    company code
+ * @param outFileName absolute path to the assembled .out ship file
+ * @param job         the Job entity (carries panKeyLocation)
+ */
+private void generateEncPanCsv(String custCode, String outFileName, Job job) {
+    String keyLocation = job.getPanKeyLocation();
+
+    if (keyLocation == null) {
+        log.warn("no panKeyLocation on job [{}], attempting intermediate CSV recovery", job.getId());
+        recoverFromIntermediateCsvs(custCode, outFileName);
+        return;
+    }
+
+    Map<String, String> plainPanMap = resolvePlainPanMapForOutput(keyLocation, outFileName);
+    if (!plainPanMap.isEmpty()) {
+        Map<String, String> encryptedMap = buildEncryptedMap(keyLocation, keyLocation, plainPanMap);
+        if (!encryptedMap.isEmpty()) {
+            writeEncPanCsv(outFileName, keyLocation, keyLocation, encryptedMap);
+            finalizeJob(custCode, keyLocation, null);
+            return;
+        }
+        log.warn("encrypted map empty for [{}], attempting intermediate CSV recovery", keyLocation);
+    } else {
+        log.warn("warm cache empty for [{}], attempting intermediate CSV recovery", keyLocation);
+    }
+
+    recoverFromIntermediateCsvs(custCode, outFileName);
+}
+resolvePlainPanMapForOutput, buildEncryptedMap, writeEncPanCsv — parameter rename only (csvPath → keyLocation), logic unchanged:
+
+java
+private Map<String, String> resolvePlainPanMapForOutput(String keyLocation, String outFileName) {
+    Map<String, String> plainPanMap = PanSubstitutionService.buildPlainPanMapForOutput(keyLocation);
+    if (plainPanMap.isEmpty()) {
+        log.debug("no cached PAN data for [{}], skipping .out.EncPan.csv", keyLocation);
+        return plainPanMap;
+    }
+
+    // Only ship indices that actually made it into the final .out file
+    plainPanMap = PanSubstitutionService.filterToIndicesPresentInOutput(keyLocation, outFileName, plainPanMap);
+    if (plainPanMap.isEmpty()) {
+        log.debug("no PAN indices present in output file [{}], skipping .out.EncPan.csv", outFileName);
+    }
+    return plainPanMap;
+}
+
+private Map<String, String> buildEncryptedMap(String keyLocation, String vaultKeyLocation, Map<String, String> plainPanMap) {
+    PanDecryptService decryptService = PanDecryptServiceHolder.getInstance();
+    return PanSubstitutionService.buildOutputCiphertextMap(keyLocation, plainPanMap, vaultKeyLocation, decryptService);
+}
+
+private void writeEncPanCsv(String outFileName, String csvPathForOutputLayout, String keyLocation, Map<String, String> encryptedMap) {
+    int[] outputAccountFieldInfo = PanSubstitutionService.getOutputAccountFieldInfo(csvPathForOutputLayout);
+    String encPanOutPath = outFileName + ".EncPan.csv";
+    EncPanCsvWriter.write(encPanOutPath, keyLocation, encryptedMap, outputAccountFieldInfo);
+}
+(Note: EncPanCsvWriter.write(..., int[] outputAccountFieldInfo) — this assumes EncPanCsvWriter takes the raw int[]{offset, length} rather than an AccountFieldLayout object, matching what PanSubstitutionService.getOutputAccountFieldInfo already returns. If your current EncPanCsvWriter.write signature takes AccountFieldLayout, construct it inline: outputAccountFieldInfo != null ? new AccountFieldLayout(outputAccountFieldInfo[0], outputAccountFieldInfo[1], true) : null — using the package-private constructor confirmed visible in image 1 of your last upload.)
+
+finalizeJob — parameter rename only, logic unchanged:
+
+java
+private void finalizeJob(String custCode, String keyLocation, File csvFile) {
+    PanSubstitutionService.evict(keyLocation);
+    if (csvFile != null) {
+        moveEncPanCsvToCompletedDir(csvFile, custCode);
+    }
+}
+(Passing null for csvFile from generateEncPanCsv above since there's no longer a real search-phase file to move — only call moveEncPanCsvToCompletedDir from the recoverFromIntermediateCsvs path, which still legitimately deals with real files on disk.)
+
+recoverFromIntermediateCsvs, findSearchCsvOnDisk, moveEncPanCsvToCompletedDir, getCSVPath — unchanged. These stay exactly as shown in your screenshots; they're the crash-recovery fallback path and remain correct as-is since every chunk's intermediate file now genuinely shares one keyLocation (fixing the bug that motivated this whole redesign).
+
+Summary table
+File	Change
+Job entity	new panKeyLocation field + getter/setter
+PanSubstitutionService	new generateKeyLocation()
+PanRestorationHelper	full rewrite — 4 methods, all keyed by keyLocation only, no reverseMap/csvPath params
+ChunkGeneratorController.postChunks	generate keyLocation once, set on job + every ChunkMessage
+SaveTriggeredConsumerDataImpl.saveConsumerData	reads cm.getEncPanCsvPath() as keyLocation, no eviction
+FullfillerDefault.fullfill	reads cm.getEncPanCsvPath() as keyLocation, no loadReverseMap
+ShipfileBuilderImpl	generateEncPanCsv takes Job, reads job.getPanKeyLocation(); eviction moved here (only place it happens)
+Let me know if you'd rather I give ChunkMessage its own dedicated panKeyLocation field instead of reusing encPanCsvPath — that's a cleaner long-term naming choice but touches every cm.getEncPanCsvPath() call site across all three files with a rename.
+
+Unable to add new field in Job entity
+
+
+Thought for 23s
+Thought for 23s
+Good — that constraint actually leads to a simpler design, not a worse one. Instead of generating a random string and needing somewhere durable to store it, derive keyLocation deterministically from job.getId(), which is already persisted, already unique, and already available everywhere via ChunkMessage.getJobId(). No entity change needed at all.
+
+Why this works as well as (or better than) a stored random value
+job.getId() is already a unique, durable, auto-generated identifier — every requirement a new panKeyLocation field would have given us, it already satisfies.
+Every stage — ChunkGeneratorController, SaveTriggeredConsumerDataImpl, FullfillerDefault, ShipfileBuilderImpl — can independently recompute the same value from job.getId() / cm.getJobId(), with zero propagation needed. That's actually more robust than passing a generated value through ChunkMessage.encPanCsvPath, since there's no window where one stage could see a stale or missing value.
+"Always generate new" is satisfied automatically: a new job has a new id, so it always gets a fresh keyLocation — no explicit generation step required at dispatch time at all.
+One trade-off worth naming honestly: job.getId() is a sequential integer, so "job-" + id is a predictable Vault path — anyone who can reach Vault (past auth) could enumerate job IDs and guess valid paths ahead of time. That's a smaller risk than it sounds (Vault's real security boundary is the AppRole token, not path secrecy), but if you want non-guessability too, salt it with a fixed per-environment constant so the path isn't purely sequential:
+
+java
+private static final String KEY_LOCATION_SALT = "a7f3-genc-dm"; // per-environment constant, not a secret
+
+public static String deriveKeyLocationForJob(long jobId) {
+    return KEY_LOCATION_SALT + "-" + jobId;
+}
+If that's not a concern for your threat model, drop the salt and just use "job-" + jobId.
+
+Changes vs. the previous version
+1. Job entity — no change. Revert whatever was added.
+2. PanSubstitutionService.java
+Replace generateKeyLocation() with a deterministic derivation:
+
+java
+private static final String KEY_LOCATION_SALT = "a7f3-genc-dm"; // per-environment constant
+
+/**
+ * Derive a job-wide key-location from the job's id. Deterministic - every
+ * stage can independently compute the same value from ChunkMessage.getJobId()
+ * without needing it propagated or persisted anywhere new. A new job always
+ * gets a new keyLocation automatically, since job ids are unique.
+ */
+public static String deriveKeyLocationForJob(long jobId) {
+    return KEY_LOCATION_SALT + "-" + jobId;
+}
+Everything else in this file is unchanged.
+
+3. PanRestorationHelper.java — no change from the last version (still takes keyLocation as a plain string parameter — doesn't care how it was produced).
+4. ChunkGeneratorController.postChunks — simpler than before, no field to set on Job
+java
+private void postChunks(Job job, Customer cust, EntityManager em) throws JMSException, NamingException {
+
+    List<Chunk> chunks = em.createNamedQuery("chunk.selectByJobId").setParameter(1, job.getId()).getResultList();
+
+    int numPosted = 0;
+    int chunkMessageType;
+
+    if (JobConstants.JOBTYPE_REGULAR.equalsIgnoreCase(job.getJobType())) {
+        chunkMessageType = BaseMessage.TYPE_DAILY;
+    } else if (JobConstants.JOBTYPE_FIRSTTIME.equalsIgnoreCase(job.getJobType())) {
+        chunkMessageType = BaseMessage.TYPE_FIRSTTIME;
+    } else if (JobConstants.JOBTYPE_ATTPLUS.equalsIgnoreCase(job.getJobType())) {
+        chunkMessageType = BaseMessage.TYPE_ATTPLUS;
+    } else {
+        chunkMessageType = BaseMessage.TYPE_DAILY;
+    }
+
+    PanDecryptService decryptService = PanDecryptServiceHolder.getInstance();
+    boolean vaultEnabled = (decryptService != null) && decryptService.isEnabled();
+    // No generation or persistence needed - every stage derives this
+    // independently from job.getId() / cm.getJobId().
+    String keyLocation = vaultEnabled ? PanSubstitutionService.deriveKeyLocationForJob(job.getId()) : null;
+
+    for (Chunk chunk : chunks) {
+
+        if ((chunk.getStartIdFid() == 0) && (chunk.getEndIdFid() == 0)) {
+            continue;
+        }
+
+        ChunkMessage msg = new ChunkMessage();
+
+        msg.setCompany(cust.getCustCode().toLowerCase());
+        msg.setCompanyId((int) job.getCustid());
+        msg.setJobId(job.getId());
+        msg.setChunkId(chunk.getId());
+        msg.setType(chunkMessageType);
+        msg.setEncPanCsvPath(keyLocation); // kept for backward compatibility with any code still reading it
+        poster.postMessage(msg, job.getPriority());
+
+        numPosted++;
+    }
+
+    job.setChunks(numPosted);
+    em.persist(job);
+
+    log.info("posted {} chunks for customer:{} job:{} with job priority of:{}",
+        numPosted, job.getCustid(), job.getId(), job.getPriority());
+}
+msg.setEncPanCsvPath(keyLocation) is now optional — since every downstream stage can recompute the identical value from cm.getJobId() alone, you don't strictly need to carry it on the message at all. I'd keep setting it anyway for one practical reason: it makes the intent visible when inspecting a ChunkMessage in logs/debugging without having to mentally re-derive it.
+
+5. SaveTriggeredConsumerDataImpl.saveConsumerData — one-line change
+java
+// was: String keyLocation = vaultEnabled ? cm.getEncPanCsvPath() : null;
+String keyLocation = vaultEnabled ? PanSubstitutionService.deriveKeyLocationForJob(cm.getJobId()) : null;
+Everything else in the method is unchanged from the previous version.
+
+6. FullfillerDefault.fullfill — one-line change
+java
+// was: String keyLocation = vaultEnabled ? cm.getEncPanCsvPath() : null;
+String keyLocation = vaultEnabled ? PanSubstitutionService.deriveKeyLocationForJob(cm.getJobId()) : null;
+Everything else (the substituteConsumerRow block, the substituteIndicDtoList block) is unchanged.
+
+7. ShipfileBuilderImpl.generateEncPanCsv — derive instead of reading a field
+java
+private void generateEncPanCsv(String custCode, String outFileName, Job job) {
+    String keyLocation = PanSubstitutionService.deriveKeyLocationForJob(job.getId());
+
+    Map<String, String> plainPanMap = resolvePlainPanMapForOutput(keyLocation, outFileName);
+    if (!plainPanMap.isEmpty()) {
+        Map<String, String> encryptedMap = buildEncryptedMap(keyLocation, keyLocation, plainPanMap);
+        if (!encryptedMap.isEmpty()) {
+            writeEncPanCsv(outFileName, keyLocation, keyLocation, encryptedMap);
+            finalizeJob(custCode, keyLocation, null);
+            return;
+        }
+        log.warn("encrypted map empty for [{}], attempting intermediate CSV recovery", keyLocation);
+    } else {
+        log.warn("warm cache empty for [{}], attempting intermediate CSV recovery", keyLocation);
+    }
+
+    recoverFromIntermediateCsvs(custCode, outFileName);
+}
+Note the keyLocation == null branch from the previous version is gone — deriveKeyLocationForJob can never return null since it's a pure string derivation, not a lookup. This actually removes a failure mode: there's no more "job's keyLocation field wasn't set" case to handle, since nothing needs setting in the first place.
+
+resolvePlainPanMapForOutput, buildEncryptedMap, writeEncPanCsv, finalizeJob, recoverFromIntermediateCsvs — all unchanged from the previous version.
+
+Net effect of this constraint
+Removing the Job.panKeyLocation field requirement actually simplified the design: no schema migration, no risk of the field being null/unset for in-flight jobs created before the change, and no dependency on ChunkMessage.encPanCsvPath being correctly propagated — every single call site derives the same value independently and correctly, permanently, from data that already exists.
+
