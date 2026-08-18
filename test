@@ -1,125 +1,417 @@
-import com.sun.jna.Native;
-import com.sun.jna.Library;
-import com.sun.jna.platform.win32.WinDef.HWND;
-import com.sun.jna.platform.win32.WinDef.RECT;
-import com.sun.jna.win32.W32APIOptions;
+package ca.tuc.triggers.processor.pan;
 
-import java.awt.AWTException;
-import java.awt.MouseInfo;
-import java.awt.Point;
-import java.awt.Robot;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.Random;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-public class KeepEdgeActive {
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 
-    // How often to check/nudge. Keep below the site's idle-timeout window
-    // (e.g., if the site times out at 5 minutes, use 120-180 seconds).
-    private static final int INTERVAL_SECONDS = 120;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.hc.client5.http.classic.methods.HttpGet;
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.hc.core5.http.io.entity.StringEntity;
+import org.apache.hc.core5.util.Timeout;
 
-    private static final String WINDOW_TITLE_FILTER = "YourSiteNameHere";
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
-    private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final Random RANDOM = new Random();
+import org.jasypt.encryption.pbe.PooledPBEStringEncryptor;
+import org.jasypt.encryption.pbe.config.SimpleStringPBEConfig;
 
-    // Minimal JNA binding for the two user32 calls we need.
-    public interface User32Ext extends Library {
-        User32Ext INSTANCE = Native.load("user32", User32Ext.class, W32APIOptions.DEFAULT_OPTIONS);
+import lombok.extern.slf4j.Slf4j;
 
-        HWND GetForegroundWindow();
+/**
+ * Vault-backed PAN decryption service using AppRole authentication.
+ * When enabled=true:
+ *   1. Authenticates to Vault via AppRole (roleId + secretId)
+ *   2. Fetches AES key from KV v2 at {kvMount}/{keyLocation}
+ *   3. Decrypts each ciphertext using Jasypt StandardPBEStringEncryptor
+ * When enabled=false:
+ *   decryptAll() returns the input map unchanged (passthrough).
+ * Vault properties are read from server-specific.properties via Spring XML.
+ */
+@Slf4j
+public class VaultPanDecryptService implements PanDecryptService {
 
-        int GetWindowTextW(HWND hWnd, char[] lpString, int nMaxCount);
+    private boolean enabled;
+    private String scheme;
+    private String host;
+    private int port = 8200;
+    private String appRolePath;
+    private String roleId;
+    private String secretId;
+    private String kvMount;
 
-        boolean GetWindowRect(HWND hWnd, RECT rect);
+    private static final String X_VAULT_TOKEN = "X-Vault-Token";
+    private static final int TIMEOUT_MS = 10000;
+    private static final int GENERATED_KEY_LENGTH = 32;
+
+    /** Cached Vault client token from AppRole login */
+    private volatile String clientToken;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    private static CloseableHttpClient buildHttpClient() {
+        RequestConfig requestConfig = RequestConfig.custom()
+                .setConnectTimeout(Timeout.ofMilliseconds(TIMEOUT_MS))
+                .setResponseTimeout(Timeout.ofMilliseconds(TIMEOUT_MS))
+                .build();
+        return HttpClientBuilder.create()
+                .setDefaultRequestConfig(requestConfig)
+                .build();
     }
 
-    public static void main(String[] args) throws AWTException {
-        Robot robot = new Robot();
-        robot.setAutoWaitForIdle(true);
+    private PooledPBEStringEncryptor getEncryptor(String encryptionKey) {
+        PooledPBEStringEncryptor encryptor = new PooledPBEStringEncryptor();
+        SimpleStringPBEConfig config = new SimpleStringPBEConfig();
+        config.setPassword(encryptionKey);
+        config.setAlgorithm("PBEWITHHMACSHA512ANDAES_256");
+        config.setIvGeneratorClassName("org.jasypt.iv.RandomIvGenerator");
+        config.setPoolSize("1");
+        encryptor.setConfig(config);
+        return encryptor;
+    }
 
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "keep-edge-active");
-            t.setDaemon(true);
-            return t;
-        });
+    /**
+     * Encrypt all plain PAN values using the AES key at the given Vault key location.
+     * If no key exists yet at that location, a new one is generated and stored,
+     * since this is the first-write path for a chunk.
+     *
+     * @param keyLocation     Vault secret path suffix (from encPan.csv header)
+     * @param indexToPlainPan map of new sequential index to plain PAN
+     * @return map of new sequential index to fresh ciphertext (not yet ENC-wrapped)
+     */
+    @Override
+    public Map<String, String> encryptAll(String keyLocation, Map<String, String> indexToPlainPan) {
 
-        log("Started. Checking every " + INTERVAL_SECONDS + "s for foreground window containing \""
-                + WINDOW_TITLE_FILTER + "\".");
+        if (!enabled) {
+            return indexToPlainPan;
+        }
 
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                HWND hwnd = User32Ext.INSTANCE.GetForegroundWindow();
-                String activeTitle = getWindowTitle(hwnd);
-                log("Detected foreground window title: \"" + activeTitle + "\"");
-                if (activeTitle != null && activeTitle.toLowerCase().contains(WINDOW_TITLE_FILTER.toLowerCase())) {
-                    nudgeMouseWithinWindow(robot, hwnd);
-                    log("Site active (\"" + activeTitle + "\") -> moved cursor within the window to keep session alive.");
-                } else {
-                    log("Site not focused (active: \"" + activeTitle + "\") -> skipped.");
-                }
-            } catch (Exception e) {
-                log("Error during activity check: " + e.getMessage());
-            }
-        }, 0, INTERVAL_SECONDS, TimeUnit.SECONDS);
-
-        // Keep the JVM alive. Ctrl+C to stop.
+        String aesKey;
         try {
-            Thread.currentThread().join();
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
+            aesKey = fetchDecryptionKey(keyLocation, true);
+        } catch (VaultException e) {
+            log.error("failed to fetch AES key from vault for output CSV encryption keyLocation=[{}]", keyLocation, e);
+            return new HashMap<>();
+        }
+
+        PooledPBEStringEncryptor encryptor = getEncryptor(aesKey);
+        Map<String, String> result = new HashMap<>();
+        for (Map.Entry<String, String> entry : indexToPlainPan.entrySet()) {
+            try {
+                String ciphertext = encryptor.encrypt(entry.getValue());
+                result.put(entry.getKey(), ciphertext);
+            } catch (Exception e) {
+                log.error("failed to encrypt PAN for index [{}]", entry.getKey(), e);
+            }
+        }
+
+        log.info("encrypted [{}] PAN values for output CSV using vault key location=[{}]", result.size(), keyLocation);
+        return result;
+    }
+
+    /**
+     * Decrypt all ciphertext values using the AES key located at the given
+     * Vault key location.
+     *
+     * @param keyLocation     Vault secret path suffix (from encPan.csv header)
+     * @param indexToEncValue map of index to raw ciphertext (already ENC-unwrapped)
+     * @return map of index to plain PAN
+     */
+    @Override
+    public Map<String, String> decryptAll(String keyLocation, Map<String, String> indexToEncValue) {
+
+        if (!enabled) {
+            return indexToEncValue;
+        }
+
+        String aesKey;
+        try {
+            aesKey = fetchDecryptionKey(keyLocation, false);
+        } catch (VaultException e) {
+            log.warn("failed to fetch AES key from vault at keyLocation=[{}], returning empty map", keyLocation, e);
+            return new HashMap<>();
+        }
+
+        PooledPBEStringEncryptor encryptor = getEncryptor(aesKey);
+        Map<String, String> result = new HashMap<>();
+        for (Map.Entry<String, String> entry : indexToEncValue.entrySet()) {
+            try {
+                String plainPan = encryptor.decrypt(entry.getValue());
+                result.put(entry.getKey(), plainPan);
+            } catch (Exception e) {
+                log.warn("failed to decrypt PAN for index [{}]", entry.getKey(), e);
+            }
+        }
+
+        log.info("decrypted [{}] PAN values using vault key location=[{}]", result.size(), keyLocation);
+        return result;
+    }
+
+    /**
+     * Fetch the decryption key from Vault KV v2 store using Apache HttpClient5.
+     * When allowGenerate is true and no key exists at keyLocation (a genuine
+     * 404), generates a new random key and persists it to Vault before
+     * returning it — used by encryptAll for first-time writes. When
+     * allowGenerate is false, a missing key is treated as an error — used by
+     * decryptAll to avoid silently fabricating a key for ciphertext that may
+     * already exist under that path. Any Vault failure other than a 404
+     * (auth errors, 5xx, network failures) always throws, regardless of
+     * allowGenerate, so transient outages never trigger key generation.
+     *
+     * @param keyLocation   Vault secret path suffix (from encPan.csv header)
+     * @param allowGenerate whether to generate+store a new key if none is found
+     * @return the decryption key value — existing or freshly generated
+     * @throws VaultException if scheme is not HTTPS, keyLocation is missing,
+     *                        the HTTP call fails, or the key is absent from
+     *                        the Vault response and allowGenerate is false
+     */
+    private String fetchDecryptionKey(String keyLocation, boolean allowGenerate) {
+        if (!"https".equalsIgnoreCase(scheme)) {
+            throw VaultException.keyFetchError(
+                "Vault communication requires HTTPS. Configured scheme '" + scheme + "' is not permitted.", null);
+        }
+        if (keyLocation == null || keyLocation.isBlank()) {
+            throw VaultException.keyFetchError(
+                "key-location is missing from the EncPan CSV header - cannot determine Vault secret path.", null);
+        }
+
+        try {
+            if (clientToken == null) {
+                clientToken = loginAppRole();
+            }
+
+            String secretUrl = String.format("%s://%s:%d/v1/%s/%s", scheme, host, port, kvMount, keyLocation);
+
+            VaultReadResult result = readKeyFromVault(secretUrl, clientToken);
+            if (result.tokenExpired()) {
+                // Token may have expired, re-authenticate once and retry
+                log.info("vault token may have expired, re-authenticating");
+                clientToken = loginAppRole();
+                result = readKeyFromVault(secretUrl, clientToken);
+            }
+
+            if (result.tokenExpired()) {
+                throw VaultException.keyFetchError("vault authentication failed even after re-login", null);
+            }
+
+            if (result.found()) {
+                log.debug("Decryption key fetched successfully from Vault.");
+                return result.key();
+            }
+
+            // result is a genuine 404 - key does not exist at this location
+            if (!allowGenerate) {
+                throw VaultException.keyMissing();
+            }
+            log.warn("no key found at keyLocation=[{}], generating a new key", keyLocation);
+            String newKey = RandomStringUtils.secure().nextAlphanumeric(GENERATED_KEY_LENGTH);
+            writeKeyToVault(secretUrl, clientToken, newKey);
+            log.debug("generated and stored new decryption key in Vault.");
+            return newKey;
+
+        } catch (VaultException e) {
+            throw e;
+        } catch (Exception e) {
+            throw VaultException.keyFetchError(e.getMessage(), e);
         }
     }
 
-    private static String getWindowTitle(HWND hwnd) {
-        if (hwnd == null) {
-            return null;
-        }
-        char[] buffer = new char[512];
-        int len = User32Ext.INSTANCE.GetWindowTextW(hwnd, buffer, buffer.length);
-        return new String(buffer, 0, len);
+    /** Outcome of a Vault KV read: distinguishes "not found" from "call failed" from "success". */
+    private record VaultReadResult(boolean found, boolean tokenExpired, String key) {
+        static VaultReadResult found(String key) { return new VaultReadResult(true, false, key); }
+        static VaultReadResult notFound() { return new VaultReadResult(false, false, null); }
+        static VaultReadResult tokenExpired() { return new VaultReadResult(false, true, null); }
     }
 
-    private static void nudgeMouseWithinWindow(Robot robot, HWND hwnd) {
-        RECT rect = new RECT();
-        if (hwnd == null || !User32Ext.INSTANCE.GetWindowRect(hwnd, rect)) {
-            // Fall back to a small nudge at the current cursor position if
-            // we couldn't read the window bounds for some reason.
-            Point p = MouseInfo.getPointerInfo().getLocation();
-            robot.mouseMove(p.x + 1, p.y + 1);
-            robot.delay(50);
-            robot.mouseMove(p.x, p.y);
-            return;
+    /**
+     * Issue the Vault KV v2 GET request and extract the "key" field from the
+     * response body. A 404 is treated as a genuine "not found" (distinct from
+     * other failures) so callers can safely decide whether to generate a new
+     * key. A 403 is treated as a possibly-expired token so the caller can
+     * retry once after re-authenticating. Any other non-2xx status, or a
+     * malformed/absent response body, is a real failure and throws.
+     */
+    private VaultReadResult readKeyFromVault(String secretUrl, String token) throws Exception {
+        try (CloseableHttpClient httpClient = buildHttpClient()) {
+            HttpGet getRequest = new HttpGet(secretUrl);
+            getRequest.setHeader(X_VAULT_TOKEN, token);
+
+            try (CloseableHttpResponse response = httpClient.execute(getRequest)) {
+                int status = response.getCode();
+
+                if (status == 404) {
+                    log.debug("no key found in vault at [{}] (404)", secretUrl);
+                    return VaultReadResult.notFound();
+                }
+                if (status == 403) {
+                    log.debug("vault returned 403 for [{}], token may be expired", secretUrl);
+                    return VaultReadResult.tokenExpired();
+                }
+
+                String body = response.getEntity() != null
+                        ? EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8)
+                        : null;
+
+                if (status < 200 || status >= 300 || body == null) {
+                    log.error("vault HTTP error: status={}", status);
+                    throw VaultException.keyFetchError("vault read failed with status=" + status, null);
+                }
+
+                JsonNode root = objectMapper.readTree(body);
+                JsonNode keyNode = root.path("data").path("data").path("panCryptoKey");
+
+                if (keyNode.isMissingNode() || keyNode.isNull() || keyNode.asText("").isBlank()) {
+                    throw VaultException.keyFetchFailed(String.valueOf(status));
+                }
+                return VaultReadResult.found(keyNode.asText());
+            }
         }
-
-        // Inset from the raw window rect so we land inside the page content
-        // area rather than on the title bar, borders, or browser chrome
-        // (tabs/toolbar). Adjust these margins if your layout differs.
-        int marginLeft = 20;
-        int marginTop = 120;   // clears title bar + tab strip + toolbar
-        int marginRight = 20;
-        int marginBottom = 20;
-
-        int minX = rect.left + marginLeft;
-        int maxX = rect.right - marginRight;
-        int minY = rect.top + marginTop;
-        int maxY = rect.bottom - marginBottom;
-
-        if (maxX <= minX || maxY <= minY) {
-            // Window too small for the assumed margins; just skip this cycle
-            // rather than moving somewhere unintended.
-            return;
-        }
-
-        int x = minX + RANDOM.nextInt(maxX - minX);
-        int y = minY + RANDOM.nextInt(maxY - minY);
-
-        robot.mouseMove(x, y);
     }
 
-    private static void log(String message) {
-        System.out.println("[" + LocalDateTime.now().format(TS) + "] " + message);
+    /**
+     * Write a newly generated PAN crypto key to Vault KV v2 at {kvMount}/{keyLocation}.
+     * Used only when fetchDecryptionKey finds no existing key at that path and
+     * allowGenerate is true.
+     */
+    private void writeKeyToVault(String secretUrl, String token, String key) throws Exception {
+        ObjectNode innerData = objectMapper.createObjectNode();
+        innerData.put("panCryptoKey", key);
+
+        ObjectNode requestBodyNode = objectMapper.createObjectNode();
+        requestBodyNode.set("data", innerData);
+
+        String jsonBody = objectMapper.writeValueAsString(requestBodyNode);
+
+        try (CloseableHttpClient httpClient = buildHttpClient()) {
+            HttpPost putRequest = new HttpPost(secretUrl);
+            putRequest.setHeader(X_VAULT_TOKEN, token);
+            putRequest.setEntity(new StringEntity(jsonBody, ContentType.APPLICATION_JSON));
+
+            try (CloseableHttpResponse response = httpClient.execute(putRequest)) {
+                int status = response.getCode();
+                if (status < 200 || status >= 300) {
+                    log.error("failed to write generated key to vault, status={}", status);
+                    throw VaultException.keyFetchError("vault write failed with status=" + status, null);
+                }
+                log.info("wrote newly generated PAN crypto key to vault");
+            }
+        }
+    }
+
+    /**
+     * Authenticate to Vault using AppRole and return the client token.
+     */
+    private String loginAppRole() throws Exception {
+        String loginUrl = buildBaseUrl() + "/v1/auth/" + appRolePath + "/login";
+
+        ObjectNode requestBodyNode = objectMapper.createObjectNode();
+        requestBodyNode.put("role_id", roleId);
+        requestBodyNode.put("secret_id", secretId);
+        String requestBody = objectMapper.writeValueAsString(requestBodyNode);
+
+        log.info("vault AppRole login at [{}]", loginUrl);
+
+        try (CloseableHttpClient httpClient = buildHttpClient()) {
+            HttpPost postRequest = new HttpPost(loginUrl);
+            postRequest.setEntity(new StringEntity(requestBody, ContentType.APPLICATION_JSON));
+
+            try (CloseableHttpResponse response = httpClient.execute(postRequest)) {
+                int status = response.getCode();
+                String body = response.getEntity() != null
+                        ? EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8)
+                        : null;
+
+                if (status < 200 || status >= 300 || body == null) {
+                    throw new IllegalStateException("vault AppRole login failed, HTTP status=" + status);
+                }
+
+                JsonNode root = objectMapper.readTree(body);
+                JsonNode tokenNode = root.path("auth").path("client_token");
+
+                if (tokenNode.isMissingNode() || tokenNode.isNull() || tokenNode.asText("").isBlank()) {
+                    throw new IllegalStateException("vault AppRole login failed, no client_token in response");
+                }
+
+                log.info("vault AppRole login successful");
+                return tokenNode.asText();
+            }
+        }
+    }
+
+    private String buildBaseUrl() {
+        return scheme + "://" + host + ":" + port;
+    }
+
+    // Spring property setters
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    public String getScheme() {
+        return scheme;
+    }
+
+    public void setScheme(String scheme) {
+        this.scheme = scheme;
+    }
+
+    public String getHost() {
+        return host;
+    }
+
+    public void setHost(String host) {
+        this.host = host;
+    }
+
+    public int getPort() {
+        return port;
+    }
+
+    public void setPort(int port) {
+        this.port = port;
+    }
+
+    public String getAppRolePath() {
+        return appRolePath;
+    }
+
+    public void setAppRolePath(String appRolePath) {
+        this.appRolePath = appRolePath;
+    }
+
+    public String getRoleId() {
+        return roleId;
+    }
+
+    public void setRoleId(String roleId) {
+        this.roleId = roleId;
+    }
+
+    public String getSecretId() {
+        return secretId;
+    }
+
+    public void setSecretId(String secretId) {
+        this.secretId = secretId;
+    }
+
+    public String getKvMount() {
+        return kvMount;
+    }
+
+    public void setKvMount(String kvMount) {
+        this.kvMount = kvMount;
     }
 }
