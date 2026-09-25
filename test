@@ -6,18 +6,19 @@ private static Object processMessage(Message m) throws JMSException {
             o = message.getText();
         }
         else if (m instanceof ObjectMessage message) {
+            // Legacy path — protected by SerialFilterConfig (JVM-wide ObjectInputFilter).
+            // Log usage so you can confirm when it's safe to remove this branch.
             try {
-                o = message.getObject();   // now protected by the JVM-wide filter set in step 1
-            } catch (InvalidClassException e) {
-                log.error("Rejected disallowed class during deserialization: " + e.getMessage());
-                return null;
+                o = message.getObject();
+                log.warn("Legacy ObjectMessage received — class: {}. Migrate this producer to JSON.",
+                        o == null ? "null" : o.getClass().getName());
             } catch (Exception e) {
-                log.error(e.getMessage(), e);
+                log.error("Rejected ObjectMessage during deserialization: {}", e.getMessage());
                 return null;
             }
         }
         else {
-            log.error("Rejected unsupported message type: " + m.getClass().getName());
+            log.error("Rejected unsupported message type: {}", m.getClass().getName());
         }
     }
     return o;
