@@ -1,13 +1,27 @@
 private void validateUrl(String url) throws DatacomException {
     try {
         URI uri = new URI(url);
+
         if (!"https".equalsIgnoreCase(uri.getScheme())) {
             throw new DatacomException("Disallowed URL scheme: " + uri.getScheme());
         }
-        InetAddress addr = InetAddress.getByName(uri.getHost());
-        if (addr.isLoopbackAddress() || addr.isLinkLocalAddress()
-                || addr.isSiteLocalAddress() || addr.isAnyLocalAddress()) {
-            throw new DatacomException("URL resolves to a disallowed internal address: " + uri.getHost());
+
+        if (uri.getUserInfo() != null) {
+            throw new DatacomException("URL must not contain embedded user info: " + url);
+        }
+
+        String host = uri.getHost();
+        if (host == null || host.isBlank()) {
+            throw new DatacomException("URL missing host: " + url);
+        }
+
+        for (InetAddress addr : InetAddress.getAllByName(host)) {
+            if (addr.isLoopbackAddress() || addr.isLinkLocalAddress()
+                    || addr.isSiteLocalAddress() || addr.isAnyLocalAddress()
+                    || addr.isMulticastAddress()) {
+                throw new DatacomException(
+                    "URL resolves to a disallowed internal/reserved address: " + host + " -> " + addr);
+            }
         }
     } catch (URISyntaxException | UnknownHostException e) {
         throw new DatacomException("Invalid or unresolvable URL: " + url);
