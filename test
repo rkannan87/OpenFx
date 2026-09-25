@@ -1,7 +1,24 @@
-private static final Pattern SAFE_CUST_CODE = Pattern.compile("^[A-Za-z0-9_-]+$");
+private static Object processMessage(Message m) throws JMSException {
+    Object o = null;
 
-private void validateCustCode(String custCode) throws DatacomException {
-    if (custCode == null || !SAFE_CUST_CODE.matcher(custCode).matches()) {
-        throw new DatacomException("Invalid customer code: " + custCode);
+    if (m != null) {
+        if (m instanceof TextMessage message) {
+            o = message.getText();
+        }
+        else if (m instanceof ObjectMessage message) {
+            try {
+                o = message.getObject();   // now protected by the JVM-wide filter set in step 1
+            } catch (InvalidClassException e) {
+                log.error("Rejected disallowed class during deserialization: " + e.getMessage());
+                return null;
+            } catch (Exception e) {
+                log.error(e.getMessage(), e);
+                return null;
+            }
+        }
+        else {
+            log.error("Rejected unsupported message type: " + m.getClass().getName());
+        }
     }
+    return o;
 }
