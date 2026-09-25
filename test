@@ -1,25 +1,21 @@
-private static Object processMessage(Message m) throws JMSException {
-    Object o = null;
+private static final Set<String> ALLOWED_COMMANDS = Set.of(
+    "cat", "mv", "rm", "ls"   // replace with the actual set of commands this app legitimately runs
+);
 
-    if (m != null) {
-        if (m instanceof TextMessage message) {
-            o = message.getText();
-        }
-        else if (m instanceof ObjectMessage message) {
-            // Legacy path — protected by SerialFilterConfig (JVM-wide ObjectInputFilter).
-            // Log usage so you can confirm when it's safe to remove this branch.
-            try {
-                o = message.getObject();
-                log.warn("Legacy ObjectMessage received — class: {}. Migrate this producer to JSON.",
-                        o == null ? "null" : o.getClass().getName());
-            } catch (Exception e) {
-                log.error("Rejected ObjectMessage during deserialization: {}", e.getMessage());
-                return null;
-            }
-        }
-        else {
-            log.error("Rejected unsupported message type: {}", m.getClass().getName());
-        }
+public String validateCmd(String cmd) throws SecurityException {
+    if (cmd == null || cmd.isBlank()) {
+        throw new SecurityException("Command must not be empty");
     }
-    return o;
+
+    // Reject shell metacharacters outright — this is the part the current code never checks
+    if (cmd.matches(".*[;&|`$<>\\n\\r].*")) {
+        throw new SecurityException("Command contains disallowed shell metacharacters: " + cmd);
+    }
+
+    String baseCommand = cmd.trim().split("\\s+")[0];
+    if (!ALLOWED_COMMANDS.contains(baseCommand)) {
+        throw new SecurityException("Disallowed command: " + baseCommand);
+    }
+
+    return cmd;
 }
