@@ -1,21 +1,7 @@
-private static final Set<String> ALLOWED_COMMANDS = Set.of(
-    "cat", "mv", "rm", "ls"   // replace with the actual set of commands this app legitimately runs
-);
-
-public String validateCmd(String cmd) throws SecurityException {
-    if (cmd == null || cmd.isBlank()) {
-        throw new SecurityException("Command must not be empty");
+private void processFormattedLinesArray(String[] arrayLines, StringBuilder strBuf) {
+    if (arrayLines != null) {
+        for (Object line : arrayLines) {
+            strBuf.append(org.apache.commons.text.StringEscapeUtils.escapeHtml4(line.toString()) + '\n');
+        }
     }
-
-    // Reject shell metacharacters outright — this is the part the current code never checks
-    if (cmd.matches(".*[;&|`$<>\\n\\r].*")) {
-        throw new SecurityException("Command contains disallowed shell metacharacters: " + cmd);
-    }
-
-    String baseCommand = cmd.trim().split("\\s+")[0];
-    if (!ALLOWED_COMMANDS.contains(baseCommand)) {
-        throw new SecurityException("Disallowed command: " + baseCommand);
-    }
-
-    return cmd;
 }
