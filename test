@@ -1,1 +1,15 @@
-False Positive: The flagged value at spring_datasources.xml:2 (http://www.springframework.org/dtd/spring-beans.dtd) is the DOCTYPE system identifier for the standard Spring beans DTD, not a runtime network call. Spring's XmlBeanDefinitionReader resolves this DTD locally from the spring-beans jar on the classpath (via its built-in entity resolver), so no HTTP request is made and no sensitive data is transmitted in cleartext. The datasource credentials in this file are externalized placeholders (${db2_dm_user}, ${db2_dm_password}), not hardcoded values. No code change required.
+private void validateUrl(String url) throws DatacomException {
+    try {
+        URI uri = new URI(url);
+        if (!"https".equalsIgnoreCase(uri.getScheme())) {
+            throw new DatacomException("Disallowed URL scheme: " + uri.getScheme());
+        }
+        InetAddress addr = InetAddress.getByName(uri.getHost());
+        if (addr.isLoopbackAddress() || addr.isLinkLocalAddress()
+                || addr.isSiteLocalAddress() || addr.isAnyLocalAddress()) {
+            throw new DatacomException("URL resolves to a disallowed internal address: " + uri.getHost());
+        }
+    } catch (URISyntaxException | UnknownHostException e) {
+        throw new DatacomException("Invalid or unresolvable URL: " + url);
+    }
+}
