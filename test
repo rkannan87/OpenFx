@@ -1,7 +1,11 @@
-private void processFormattedLinesArray(String[] arrayLines, StringBuilder strBuf) {
-    if (arrayLines != null) {
-        for (Object line : arrayLines) {
-            strBuf.append(org.apache.commons.text.StringEscapeUtils.escapeHtml4(line.toString()) + '\n');
-        }
-    }
-}
+The flagged URLs on line 4 are XML namespace/xsi:schemaLocation identifiers, which Spring resolves from XSDs bundled in its own jars via META-INF/spring.schemas, so nothing is fetched over the network at runtime.
+
+The file is static deployment configuration with no user-controlled input, no DOCTYPE, and no external entities, so there is no SSRF or XXE vector.
+
+The flagged http:// value on line 2 is the DOCTYPE DTD system identifier for spring-beans.dtd, not a network request. Spring resolves it from the DTD bundled in its own jar, so no data is transmitted over HTTP at runtime.
+
+The file is static deployment configuration with no sensitive data or user-controlled input involved.
+
+The flagged http:// value on line 2 is the DOCTYPE DTD system identifier for spring-beans.dtd, not a network request. Spring resolves it from the DTD bundled in its own jar, so no data is transmitted over HTTP at runtime.
+
+The file is static deployment configuration with no sensitive data or user-controlled input involved.
