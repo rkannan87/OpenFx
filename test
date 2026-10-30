@@ -1,11 +1,37 @@
-The flagged URLs on line 4 are XML namespace/xsi:schemaLocation identifiers, which Spring resolves from XSDs bundled in its own jars via META-INF/spring.schemas, so nothing is fetched over the network at runtime.
+Analyze the <PaymentSubstitution> flow starting at <Controller/Listener>.
+Produce docs/frd/<module>.md with:
+- FR-xxx functional requirements (what the system does, in business terms)
+- BR-xxx business rules: validations, conditionals, calculations, state transitions
+- Inputs/outputs, data entities, and field-level mappings
+- Error handling, retries, idempotency, and transaction boundaries
+- NFRs visible in code: security, PCI controls, timeouts, logging
+- Traceability: every FR/BR cites file:line
+- "Unclear/possibly dead code" section. Don't guess; flag it.
+Do not propose fixes yet.
 
-The file is static deployment configuration with no user-controlled input, no DOCTYPE, and no external entities, so there is no SSRF or XXE vector.
 
-The flagged http:// value on line 2 is the DOCTYPE DTD system identifier for spring-beans.dtd, not a network request. Spring resolves it from the DTD bundled in its own jar, so no data is transmitted over HTTP at runtime.
 
-The file is static deployment configuration with no sensitive data or user-controlled input involved.
+Analyze the <Capability> flow starting at <Controller/Listener/Job>,
+following ALL downstream calls, including shared utils, config, and SQL.
+Produce docs/frd/<module>.md with:
+- FR-xxx functional requirements (business terms)
+- BR-xxx business rules: validations, conditionals, calculations,
+  state transitions, hardcoded values, config-driven values
+- Inputs/outputs, data entities, field-level mappings
+- Error handling, retries, idempotency, transaction boundaries
+- NFRs in code: security, PCI controls, timeouts, logging, audit
+- Integrations: endpoints/topics, contracts, auth, timeouts
+- Traceability: every FR/BR cites file:line
+- Unclear/possibly dead code. Don't guess; flag it.
+- Files covered: list every file you read for this flow.
 
-The flagged http:// value on line 2 is the DOCTYPE DTD system identifier for spring-beans.dtd, not a network request. Spring resolves it from the DTD bundled in its own jar, so no data is transmitted over HTTP at runtime.
-
-The file is static deployment configuration with no sensitive data or user-controlled input involved.
+Separate section: "Modernization Observations" (observations only, no code):
+- Outdated libraries/APIs (javax.*, deprecated Spring, old Java idioms)
+- Design smells: god classes, tight coupling, duplicated logic, mixed concerns
+- Missing tests for BRs
+- Security/compliance risks (PCI DSS 4.0, secrets, logging of sensitive data)
+- Resilience gaps: no retry, no timeout, no circuit breaker, no idempotency
+- Observability gaps: logging, metrics, tracing
+- Cloud/container readiness blockers: local state, file system, hardcoded hosts
+Rate each: Severity (H/M/L) and Effort (S/M/L). Cite file:line.
+Do not change code.
