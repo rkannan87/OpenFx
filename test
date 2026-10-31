@@ -35,3 +35,84 @@ Separate section: "Modernization Observations" (observations only, no code):
 - Cloud/container readiness blockers: local state, file system, hardcoded hosts
 Rate each: Severity (H/M/L) and Effort (S/M/L). Cite file:line.
 Do not change code.
+
+
+Here are prompts for the other phases. Run them in order and change the names in <> to match your project.
+
+Discovery / inventory
+
+text
+Scan this repo and create docs/frd/00-inventory.md listing every entry point
+(REST endpoints, Kafka consumers/producers, @Scheduled jobs, batch, SFTP, CLI).
+For each: class/method, trigger, downstream call chain, DB tables touched,
+external systems. Group by business capability. No assumptions; cite file:line.
+
+Domain model and data dictionary
+
+text
+From entities, DTOs, Flyway/Liquibase scripts and SQL, build
+docs/frd/data-dictionary.md: each entity, fields, types, constraints,
+relationships, enums with meaning, and which FRs read or write it.
+Flag fields that look unused or are written but never read.
+
+Business rules deep-dive
+
+text
+In <module>, find every if/switch/validator/calculation that encodes a
+business decision. List each as BR-xxx in plain English:
+"When <condition>, the system <action>". Include hardcoded values and magic
+numbers, plus config-driven values (application.yml, Vault, feature flags).
+Cite file:line.
+
+State and workflow
+
+text
+Identify all status fields and lifecycle transitions in <module>.
+Produce a state transition table (from → event → to → guard → side effects)
+and a Mermaid stateDiagram. Flag any transitions that are possible in code
+but look unintended.
+
+Integrations and contracts
+
+text
+Document every external interface: endpoint/topic, request/response schema,
+headers, auth (OAuth2/mTLS), timeouts, retries, circuit breakers,
+idempotency keys, and the error mapping. Output as an interface catalogue
+in docs/frd/integrations.md.
+
+Non-functional and security requirements
+
+text
+Extract NFRs evident in code/config: security controls (encryption,
+masking, tokenization, Vault usage), audit logging, PCI-relevant handling,
+performance settings (pools, batch sizes, caching), and resilience.
+Flag gaps against <PCI DSS 4.0 / internal standard> as observations only.
+
+Gap and dead-code check
+
+text
+Compare docs/frd/*.md against the codebase. List public methods, endpoints,
+and branches not mapped to any FR/BR. Classify each as: missing requirement,
+dead code, or technical plumbing. Produce a coverage % per module.
+
+SME questions
+
+text
+Review the FRD and list ambiguities as questions a business analyst can
+answer: conflicting rules, suspected bugs that may be "features",
+undocumented defaults. Format: Q-xxx, context, code ref, options.
+
+Characterization tests
+
+text
+For each BR-xxx in docs/frd/<module>.md, write JUnit 5 tests that lock in
+current behavior (including odd behavior). Name tests after the BR ID.
+Don't change production code. Report any BR you couldn't test and why.
+
+Refactoring plan (use plan mode)
+
+text
+Using the FRD and test suite as the contract, propose a refactoring plan
+for <module>: target structure, steps in order, risk per step, and which
+FR/BR each step touches. Each step must be one reviewable PR that keeps
+all characterization tests green.
